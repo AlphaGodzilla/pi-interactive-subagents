@@ -51,6 +51,7 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import { appendSteerMessage, getSubagentSteerFile } from "./steer.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -164,6 +165,7 @@ const SPAWNING_TOOLS = new Set([
   "subagent_interrupt",
   "subagents_list",
   "subagent_resume",
+  "subagent_steer",
 ]);
 
 /**
@@ -494,6 +496,7 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  steerFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -832,6 +835,78 @@ function handleSubagentInterrupt(
   };
 }
 
+/**
+ * Enqueue a steering message for a running subagent. The message is written
+ * to the child's steer inbox; the child's subagent-done extension drains it
+ * and injects it into the child session as a user message (interrupting the
+ * current turn after the in-flight tool execution when busy).
+ */
+function handleSubagentSteer(
+  params: { id?: string; name?: string; message?: string },
+  append: (steerFile: string, message: string, from?: string) => void = appendSteerMessage,
+) {
+  const message = params.message?.trim();
+  if (!message) {
+    return {
+      content: [{ type: "text" as const, text: "Provide a steering message to send." }],
+      details: { error: "message required" },
+    };
+  }
+
+  const resolved = resolveInterruptTarget(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+  if (running.cli === "claude") {
+    return {
+      content: [{
+        type: "text" as const,
+        text:
+          "Steering is currently supported only for Pi-backed subagents. Claude-backed steering has not been verified yet.",
+      }],
+      details: { error: "claude steer unsupported", id: running.id, name: running.name },
+    };
+  }
+
+  if (!running.steerFile) {
+    return {
+      content: [{
+        type: "text" as const,
+        text:
+          `Subagent "${running.name}" has no steer inbox — it was launched before steering support or not by this orchestrator.`,
+      }],
+      details: { error: "no steer inbox", id: running.id, name: running.name },
+    };
+  }
+
+  try {
+    append(running.steerFile, message);
+  } catch (error: any) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `Failed to queue steering message for subagent "${running.name}": ${error?.message ?? String(error)}`,
+      }],
+      details: { error: "steer write failed", id: running.id, name: running.name },
+    };
+  }
+
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Steering message queued for subagent "${running.name}". ` +
+        "It will be delivered into the subagent's session (interrupting the current turn after the in-flight tool execution when busy).",
+    }],
+    details: { id: running.id, name: running.name, message, status: "steered" },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -907,6 +982,7 @@ export const __test__ = {
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
+  handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -1137,7 +1213,10 @@ async function launchSubagent(
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  const steerFile = getSubagentSteerFile(artifactDir, id);
+  mkdirSync(dirname(steerFile), { recursive: true });
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+  envParts.push(`PI_SUBAGENT_STEER_FILE=${shellEscape(steerFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
@@ -1204,6 +1283,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    steerFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1647,6 +1727,69 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_steer tool ──
+  if (shouldRegister("subagent_steer"))
+    pi.registerTool({
+      name: "subagent_steer",
+      label: "Steer Subagent",
+      description:
+        "Send a steering message to a currently running Pi-backed subagent. " +
+        "The message is delivered into the subagent's session as a user message: " +
+        "if the subagent is mid-turn it interrupts after the current tool execution, " +
+        "if it is idle it starts a new turn. " +
+        "Delivery is asynchronous (the child polls its inbox ~every 500ms) and does not emit a subagent_result " +
+        "just because the message was queued. " +
+        "The child pane, session, watcher, and running entry remain alive. " +
+        "Claude Code-backed subagents are not supported yet; use subagent_interrupt or wait for the result instead.",
+      promptSnippet:
+        "Send a steering message to a currently running Pi-backed subagent. " +
+        "The message is delivered into the subagent's session as a user message: " +
+        "if the subagent is mid-turn it interrupts after the current tool execution, " +
+        "if it is idle it starts a new turn. " +
+        "Delivery is asynchronous (the child polls its inbox ~every 500ms) and does not emit a subagent_result " +
+        "just because the message was queued. " +
+        "The child pane, session, watcher, and running entry remain alive. " +
+        "Claude Code-backed subagents are not supported yet; use subagent_interrupt or wait for the result instead.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        message: Type.String({ description: "The steering message to deliver to the subagent" }),
+      }),
+
+      async execute(_toolCallId, params) {
+        return handleSubagentSteer(params);
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — steer"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "steered") {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.name ?? details.id ?? "subagent")) +
+              theme.fg("dim", " — steering message queued"),
+            0,
+            0,
+          );
+        }
+
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
   // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
     pi.registerTool({
@@ -1805,6 +1948,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+        const steerFile = getSubagentSteerFile(artifactDir, id);
+        mkdirSync(dirname(steerFile), { recursive: true });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -1833,6 +1978,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_STEER_FILE=${shellEscape(steerFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
@@ -1870,6 +2016,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: params.sessionPath,
           launchScriptFile,
           activityFile,
+          steerFile,
           interactive,
           statusState: createStatusState({
             source: "pi",

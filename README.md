@@ -62,12 +62,13 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 2 subagent-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_steer`     | Send a steering message into a running Pi-backed subagent's session                         |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
@@ -193,6 +194,35 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
+
+---
+
+## Steering a running subagent
+
+Use `subagent_steer` to redirect a running Pi-backed subagent without killing its session:
+
+```typescript
+subagent_steer({ id: "abcd1234", message: "Stop refactoring — the API tests are failing, fix those first." });
+// or
+subagent_steer({ name: "Worker", message: "The user changed the requirement: use v2 of the schema." });
+```
+
+**`subagent_steer` parameters:**
+- `message` (required): The steering message, delivered verbatim as a user message in the subagent's conversation
+- `id` (optional): Exact running subagent id (from the `subagent` result details)
+- `name` (optional): Exact running subagent display name
+
+**How delivery works:** the message is written to a per-child inbox sidecar and the child extension polls it (~every 500ms, one message per poll). Delivery semantics follow pi's native steer behavior:
+
+- The child is **mid-turn** (streaming or executing tools) → the message interrupts after the current tool execution and is injected as a user message, so the child can incorporate the redirect on its next step.
+- The child is **idle** at the prompt (e.g. an interactive agent) → the message starts a new turn.
+
+The child session, watcher, and running entry all stay alive — a steer is *not* a result and does not emit `subagent_result`. The full message text (multi-line, unicode, leading `/`) is preserved; it cannot accidentally trigger a slash command in the child session.
+
+> **Notes:**
+> - Only Pi-backed subagents are supported — Claude-backed runs return an error.
+> - The target must still be *running* (listed in the widget). To follow up with a session that already exited, use `subagent_resume` with a `message` instead.
+> - Messages queued for a child that exits before its next poll are not delivered (the child polls its inbox only while alive).
 
 ---
 

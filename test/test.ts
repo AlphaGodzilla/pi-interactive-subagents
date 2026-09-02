@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
@@ -53,7 +53,14 @@ import {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  resolveSteerPolling,
 } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  appendSteerMessage,
+  createSteerPoller,
+  drainSteerMessages,
+  getSubagentSteerFile,
+} from "../pi-extension/subagents/steer.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
@@ -1284,6 +1291,42 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError([]), null);
     });
   });
+
+  describe("resolveSteerPolling", () => {
+    it("stays inert without subagent env vars (main agent session)", () => {
+      // This is the guard that keeps the steer poller off in the main agent
+      // session even if subagent-done.ts were loaded there.
+      assert.deepEqual(resolveSteerPolling({}), { enabled: false, steerFile: null });
+      assert.deepEqual(
+        resolveSteerPolling({ PI_SUBAGENT_SESSION: "/tmp/x.jsonl" }),
+        { enabled: false, steerFile: null },
+      );
+      assert.deepEqual(
+        resolveSteerPolling({ PI_SUBAGENT_STEER_FILE: "/tmp/inbox.jsonl" }),
+        { enabled: false, steerFile: null },
+      );
+    });
+
+    it("enables polling only when the orchestrator passed the inbox path", () => {
+      assert.deepEqual(
+        resolveSteerPolling({
+          PI_SUBAGENT_SESSION: "/tmp/child.jsonl",
+          PI_SUBAGENT_STEER_FILE: "/tmp/child-steer.jsonl",
+        }),
+        { enabled: true, steerFile: "/tmp/child-steer.jsonl" },
+      );
+    });
+
+    it("treats blank env values as absent", () => {
+      assert.deepEqual(
+        resolveSteerPolling({
+          PI_SUBAGENT_SESSION: "  ",
+          PI_SUBAGENT_STEER_FILE: "",
+        }),
+        { enabled: false, steerFile: null },
+      );
+    });
+  });
 });
 
 describe("cmux.ts interpretExitSidecar", () => {
@@ -1355,6 +1398,7 @@ describe("tool registration", () => {
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
     assert.equal(denied.has("subagent_resume"), true);
+    assert.equal(denied.has("subagent_steer"), true);
   });
 
   it("renders partial subagent tool-call args without throwing", () => {
@@ -1862,6 +1906,228 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+});
+
+describe("steering messages", () => {
+  describe("steer.ts inbox", () => {
+    it("builds a per-child inbox path under the artifact dir", () => {
+      const steerFile = getSubagentSteerFile("/tmp/artifacts/sess-1", "abc123");
+      assert.equal(steerFile, "/tmp/artifacts/sess-1/subagent-steer/abc123.jsonl");
+    });
+
+    it("round-trips messages in order and preserves arbitrary text", () => {
+      withTempDir((dir) => {
+        const steerFile = getSubagentSteerFile(dir, "child-1");
+        appendSteerMessage(steerFile, "Focus on the API design first");
+        appendSteerMessage(steerFile, "Line one\nLine two with /special chars \"quoted\" and 中文");
+
+        const drained = drainSteerMessages(steerFile);
+        assert.equal(drained.length, 2);
+        assert.equal(drained[0].message, "Focus on the API design first");
+        assert.equal(
+          drained[1].message,
+          "Line one\nLine two with /special chars \"quoted\" and 中文",
+        );
+        assert.equal(drained[0].from, "parent");
+        assert.ok(drained[0].sentAt.length > 0);
+
+        // Inbox is empty after draining
+        assert.deepEqual(drainSteerMessages(steerFile), []);
+      });
+    });
+
+    it("skips malformed lines without wedging the inbox", () => {
+      withTempDir((dir) => {
+        const steerFile = getSubagentSteerFile(dir, "child-2");
+        mkdirSync(dirname(steerFile), { recursive: true });
+        writeFileSync(steerFile, "not-json\n{\"message\": 42}\n{\"message\": \"ok\"}\n", "utf8");
+
+        const drained = drainSteerMessages(steerFile);
+        assert.equal(drained.length, 1);
+        assert.equal(drained[0].message, "ok");
+      });
+    });
+
+    it("picks up messages appended after a previous drain", () => {
+      withTempDir((dir) => {
+        const steerFile = getSubagentSteerFile(dir, "child-3");
+        appendSteerMessage(steerFile, "first");
+        assert.equal(drainSteerMessages(steerFile).length, 1);
+        assert.equal(drainSteerMessages(steerFile).length, 0);
+        appendSteerMessage(steerFile, "second");
+        const drained = drainSteerMessages(steerFile);
+        assert.equal(drained.length, 1);
+        assert.equal(drained[0].message, "second");
+      });
+    });
+  });
+
+  describe("steer poller", () => {
+    it("delivers one message per poll with steer delivery and requeues the rest", () => {
+      withTempDir((dir) => {
+        const steerFile = getSubagentSteerFile(dir, "child-1");
+        appendSteerMessage(steerFile, "msg-a");
+        appendSteerMessage(steerFile, "msg-b");
+        appendSteerMessage(steerFile, "msg-c");
+
+        const delivered: Array<{ message: string; options?: unknown }> = [];
+        const poller = createSteerPoller({
+          steerFile,
+          sendUserMessage(message, options) {
+            delivered.push({ message, options });
+          },
+        });
+
+        assert.equal(poller.poll(), 3); // drained all three…
+        assert.equal(delivered.length, 1); // …but delivered only the first
+        assert.equal(delivered[0].message, "msg-a");
+        assert.deepEqual(delivered[0].options, { deliverAs: "steer" });
+
+        assert.equal(poller.poll(), 2); // drained [b, c]…
+        assert.equal(delivered.length, 2); // …delivered only b, requeued c
+        assert.equal(delivered[1].message, "msg-b");
+        assert.equal(poller.poll(), 1);
+        assert.equal(delivered.length, 3);
+        assert.equal(delivered[2].message, "msg-c");
+        assert.equal(poller.poll(), 0);
+      });
+    });
+  });
+
+  describe("subagent_steer tool", () => {
+    function makeRunning(overrides: Record<string, unknown> = {}) {
+      return {
+        id: "a1",
+        name: "Worker",
+        task: "",
+        surface: "pane-1",
+        startTime: 0,
+        sessionFile: "worker.jsonl",
+        steerFile: "/tmp/worker.steer.jsonl",
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+        ...overrides,
+      };
+    }
+
+    it("registers subagent_steer in the main session extension", () => {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const steerTool = registeredTools.find((tool) => tool.name === "subagent_steer");
+      assert.ok(steerTool, "expected subagent_steer tool to be registered");
+      assert.equal(steerTool.parameters.required.includes("message"), true);
+      const messageSchema = steerTool.parameters.properties.message;
+      assert.equal(messageSchema.type, "string");
+    });
+
+    it("queues a steering message into the running subagent's inbox", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      try {
+        const appended: Array<{ file: string; message: string }> = [];
+        runningMap.set("a1", makeRunning({ id: "a1" }));
+        const result = testApi.handleSubagentSteer(
+          { name: "Worker", message: "Please switch to plan B" },
+          (file: string, message: string) => {
+            appended.push({ file, message });
+          },
+        );
+
+        assert.equal(result.details.status, "steered");
+        assert.equal(result.details.name, "Worker");
+        assert.equal(result.details.message, "Please switch to plan B");
+        assert.equal(appended.length, 1);
+        assert.equal(appended[0].file, "/tmp/worker.steer.jsonl");
+        assert.equal(appended[0].message, "Please switch to plan B");
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("resolves by exact id and rejects ambiguous names", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      try {
+        runningMap.set("a1", makeRunning({ id: "a1", name: "Worker" }));
+        runningMap.set("b2", makeRunning({ id: "b2", name: "Worker" }));
+        runningMap.set("c3", makeRunning({ id: "c3", name: "Scout" }));
+
+        const byId = testApi.handleSubagentSteer(
+          { id: "c3", message: "steer c3" },
+          () => {},
+        );
+        assert.equal(byId.details.id, "c3");
+        assert.equal(byId.details.status, "steered");
+
+        const ambiguous = testApi.handleSubagentSteer(
+          { name: "Worker", message: "steer ambiguous" },
+          () => {},
+        );
+        assert.match(ambiguous.content[0].text, /Ambiguous subagent name/);
+
+        const missing = testApi.handleSubagentSteer(
+          { name: "Ghost", message: "hi" },
+          () => {},
+        );
+        assert.match(missing.content[0].text, /No running subagent named/);
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("rejects missing messages, Claude-backed children, and missing inboxes", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      try {
+        const noMessage = testApi.handleSubagentSteer({ name: "Worker" });
+        assert.match(noMessage.content[0].text, /Provide a steering message/);
+
+        runningMap.set("c9", makeRunning({ id: "c9", name: "ClaudeKid", cli: "claude" }));
+        const claude = testApi.handleSubagentSteer(
+          { name: "ClaudeKid", message: "hi" },
+          () => {
+            throw new Error("should not be called");
+          },
+        );
+        assert.match(claude.content[0].text, /only for Pi-backed subagents/);
+
+        runningMap.set("d4", makeRunning({ id: "d4", name: "NoInbox" }));
+        const runningNoInbox = runningMap.get("d4");
+        delete runningNoInbox.steerFile;
+        const noInbox = testApi.handleSubagentSteer(
+          { name: "NoInbox", message: "hi" },
+          () => {
+            throw new Error("should not be called");
+          },
+        );
+        assert.match(noInbox.content[0].text, /no steer inbox/);
+      } finally {
+        runningMap.clear();
+      }
+    });
+
+    it("reports write failures instead of claiming success", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const runningMap = testApi.runningSubagents as Map<string, any>;
+      runningMap.clear();
+      try {
+        runningMap.set("a1", makeRunning({ id: "a1" }));
+        const result = testApi.handleSubagentSteer(
+          { name: "Worker", message: "hi" },
+          () => {
+            throw new Error("disk full");
+          },
+        );
+        assert.match(result.content[0].text, /Failed to queue steering message/);
+        assert.match(result.details.error, /steer write failed/);
+      } finally {
+        runningMap.clear();
+      }
+    });
   });
 });
 

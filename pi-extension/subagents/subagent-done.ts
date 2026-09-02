@@ -2,12 +2,44 @@
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides `caller_ping` (child → parent help requests)
+ * - Drains the steering-message inbox so the parent can redirect a running child
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSteerPoller, type SteerPoller } from "./steer.ts";
+
+// Survive /reload: the previous module instance may still hold a running
+// steer-inbox interval. /reload re-imports this file, so clear it at load.
+const STEER_INTERVAL_KEY = Symbol.for("pi-subagents/steer-interval");
+{
+  const prevInterval = (globalThis as any)[STEER_INTERVAL_KEY];
+  if (prevInterval) {
+    clearInterval(prevInterval);
+    (globalThis as any)[STEER_INTERVAL_KEY] = null;
+  }
+}
+
+/**
+ * Decide whether the steer-inbox poller should run for this process.
+ *
+ * The poller is strictly opt-in: it only starts when the orchestrator passed
+ * PI_SUBAGENT_STEER_FILE (and the child session env var is present). Without
+ * them — e.g. if this extension were loaded into the main agent session —
+ * steering is fully inert, mirroring how caller_ping and the activity recorder
+ * already guard on subagent env vars.
+ */
+export function resolveSteerPolling(env: {
+  PI_SUBAGENT_SESSION?: string;
+  PI_SUBAGENT_STEER_FILE?: string;
+}): { enabled: boolean; steerFile: string | null } {
+  const session = env.PI_SUBAGENT_SESSION?.trim();
+  const steerFile = env.PI_SUBAGENT_STEER_FILE?.trim();
+  return session && steerFile ? { enabled: true, steerFile } : { enabled: false, steerFile: null };
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -90,6 +122,34 @@ export default function (pi: ExtensionAPI) {
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
+  // Steering-message inbox (subagent_steer tool on the parent side).
+  // Strictly opt-in: the poller only exists when the orchestrator passed
+  // PI_SUBAGENT_STEER_FILE. Without it — including when this extension is
+  // loaded into the main agent session — steering stays fully inert.
+  const steerConfig = resolveSteerPolling(process.env as Record<string, string | undefined>);
+  const steerPoller: SteerPoller | null = steerConfig.enabled && steerConfig.steerFile
+    ? createSteerPoller({
+        steerFile: steerConfig.steerFile,
+        sendUserMessage: (message, options) => pi.sendUserMessage(message, options),
+      })
+    : null;
+
+  function startSteerPolling(): void {
+    if (!steerPoller) return;
+    const existing = (globalThis as any)[STEER_INTERVAL_KEY] as ReturnType<typeof setInterval> | null;
+    if (existing) return; // already polling (session_start can fire again after a reload)
+    steerPoller.poll(); // deliver anything that arrived before the interval started
+    (globalThis as any)[STEER_INTERVAL_KEY] = setInterval(() => steerPoller.poll(), 500);
+  }
+
+  function stopSteerPolling(): void {
+    const existing = (globalThis as any)[STEER_INTERVAL_KEY] as ReturnType<typeof setInterval> | null;
+    if (existing) {
+      clearInterval(existing);
+      (globalThis as any)[STEER_INTERVAL_KEY] = null;
+    }
+  }
+
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
       "subagent-tools",
@@ -152,6 +212,7 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+    startSteerPolling();
   });
 
   pi.on("input", () => {
@@ -253,6 +314,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    stopSteerPolling();
     recorder.sessionShutdown((event as any).reason);
   });
 

@@ -276,6 +276,64 @@ for (const backend of backends) {
       );
     });
 
+    // ── Steering ──
+
+    it("subagent_steer redirects a running subagent mid-task", async () => {
+      const id = uniqueId();
+      const startFile = `/tmp/pi-integ-steer-start-${id}.txt`;
+      const ignoredFile = `/tmp/pi-integ-steer-ignored-${id}.txt`;
+      const steerMarker = `/tmp/pi-integ-steer-${id}.txt`;
+      trackTempFile(env, startFile);
+      trackTempFile(env, ignoredFile);
+      trackTempFile(env, steerMarker);
+
+      const surface = createTrackedSurface(env, `steer-${id}`);
+      await sleep(1000);
+
+      // The child runs a long bash command (sleep 40) so there is a generous
+      // window for the parent's steer to land while the child is still running.
+      // Steering is delivered after the current tool execution finishes, so
+      // the child completes the sleep first, then acts on the redirected task.
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Steer-${id}"`,
+        `  agent: "test-echo"`,
+        `  task: "Run this bash command: echo 'CHILD_START_${id}' > '${startFile}'; sleep 40; echo 'CHILD_SLEEP_DONE_${id}' > '${ignoredFile}'"`,
+        `Call the subagent tool exactly once and wait for its result details.`,
+        `Then run: sleep 12`,
+        `After the sleep, call subagent_steer with these EXACT parameters:`,
+        `  name: "Steer-${id}"`,
+        `  message: "Change of plan: run this bash command: echo 'STEERED_${id}' > '${steerMarker}', then call subagent_done."`,
+        `After subagent_steer returns, say STEER_SENT.`,
+        `After the subagent result arrives, say STEER_TEST_DONE.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      // Child started its long task
+      await waitForFile(startFile, PI_TIMEOUT, /CHILD_START/);
+
+      // Parent queued the steer
+      await waitForScreen(surface, /STEER_SENT|steering message queued/i, PI_TIMEOUT);
+
+      // The original long tool call ran to completion (steer waits for it)...
+      const ignored = await waitForFile(ignoredFile, PI_TIMEOUT * 2, /CHILD_SLEEP_DONE/);
+      assert.ok(
+        ignored.includes(`CHILD_SLEEP_DONE_${id}`),
+        `Original task marker should exist: ${ignored.trim()}`,
+      );
+
+      // ...then the child processed the steering message and redirected
+      const content = await waitForFile(steerMarker, PI_TIMEOUT * 2, /STEERED/);
+      assert.ok(
+        content.includes(`STEERED_${id}`),
+        `Steer marker should contain STEERED_${id}: ${content.trim()}`,
+      );
+
+      const screen = await waitForScreen(surface, /STEER_TEST_DONE|completed/i, PI_TIMEOUT * 2);
+      assert.ok(/STEER_TEST_DONE|completed/i.test(screen));
+    });
+
     // ── Agent discovery ──
 
     it("subagent discovers project-local test agents", async () => {
