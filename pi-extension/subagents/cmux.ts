@@ -942,7 +942,7 @@ export function renameCurrentTab(title: string): void {
   }
 
   // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
-  // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
+  // rename-tab clobbers the user's tab title whenever a subagent starts.
   // Closes #21.
   const paneId = process.env.ZELLIJ_PANE_ID;
   if (paneId) {
