@@ -74,12 +74,35 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
+  rotateModuleAbortController();
+}
+
+/**
+ * Abort the current process-wide poll controller and install a fresh one.
+ *
+ * POLL_ABORT_KEY is a process-wide singleton (Symbol.for on globalThis, so it
+ * survives /reload). Aborting it kills watchers that captured the previous
+ * controller; installing a fresh one immediately after means future watchers
+ * (getModuleAbortSignal) are never left pointing at an aborted signal.
+ */
+function rotateModuleAbortController(): void {
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
+  if (prevAbort && !prevAbort.signal.aborted) prevAbort.abort();
   (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
 }
 
+/**
+ * Return a live abort signal for watcher poll loops.
+ *
+ * Self-heals: if the stored controller was aborted by anything other than a
+ * module reload (e.g. a session_shutdown that raced ahead of this spawn),
+ * rotate so the returned signal is never already-aborted.
+ */
 function getModuleAbortSignal(): AbortSignal {
+  const current = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  if (current?.signal.aborted) {
+    rotateModuleAbortController();
+  }
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
@@ -1053,6 +1076,8 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   resolveParentModel,
+  rotateModuleAbortController,
+  getModuleAbortSignal,
   runningSubagents,
   formatElapsed,
 };
@@ -1559,8 +1584,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    // Abort the current watcher generation AND install a fresh controller.
+    // pi fires session_shutdown on session replace/resume/quit — not just
+    // /reload. Aborting without rotating permanently poisoned the shared
+    // controller for the whole process: every subagent spawned afterwards
+    // (in any session of this process) died instantly in pollForExit with
+    // "Aborted while waiting for subagent to finish". Rotation kills only
+    // watchers that captured the previous generation and keeps new spawns
+    // working in the session that replaces this one.
+    rotateModuleAbortController();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }

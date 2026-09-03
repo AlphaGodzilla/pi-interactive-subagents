@@ -2669,3 +2669,47 @@ describe("resolveParentModel", () => {
     });
   });
 });
+
+describe("poll abort controller lifecycle", () => {
+  const KEY = Symbol.for("pi-subagents/poll-abort-controller");
+
+  it("getModuleAbortSignal self-heals when the shared controller was aborted (session_shutdown poison)", () => {
+    // Simulate the historical bug: something aborted the process-wide
+    // controller and nothing rotated it. A watcher signal must never be
+    // already-aborted at spawn time.
+    const poisoned = new AbortController();
+    poisoned.abort();
+    (globalThis as any)[KEY] = poisoned;
+
+    const signal = subagentsModule.__test__.getModuleAbortSignal();
+    assert.equal(signal.aborted, false);
+
+    // And the stored controller is a fresh one, not the poisoned instance.
+    const stored = (globalThis as any)[KEY] as AbortController;
+    assert.notEqual(stored, poisoned);
+    assert.equal(stored.signal.aborted, false);
+  });
+
+  it("rotateModuleAbortController aborts the previous generation and installs a live controller", () => {
+    const first = new AbortController();
+    (globalThis as any)[KEY] = first;
+    subagentsModule.__test__.rotateModuleAbortController();
+
+    const stored = (globalThis as any)[KEY] as AbortController;
+    assert.notEqual(stored, first);
+    assert.equal(first.signal.aborted, true);
+    assert.equal(stored.signal.aborted, false);
+
+    // A signal captured before the rotation is cancelled; a fresh read is not.
+    assert.equal(first.signal.aborted, true);
+    assert.equal(subagentsModule.__test__.getModuleAbortSignal().aborted, false);
+  });
+
+  it("rotateModuleAbortController is idempotent on an already-aborted controller", () => {
+    const poisoned = new AbortController();
+    poisoned.abort();
+    (globalThis as any)[KEY] = poisoned;
+    subagentsModule.__test__.rotateModuleAbortController();
+    assert.equal(((globalThis as any)[KEY] as AbortController).signal.aborted, false);
+  });
+});
