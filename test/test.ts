@@ -2617,3 +2617,55 @@ describe("cmux.ts", () => {
     });
   });
 });
+
+describe("resolveParentModel", () => {
+  let dir: string;
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-subagent-model-"));
+  });
+  after(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeSession(lines: string[]): string {
+    const file = join(dir, `session-${Math.random().toString(16).slice(2)}.jsonl`);
+    writeFileSync(file, lines.map((l) => l.trim()).filter(Boolean).join("\n") + "\n", "utf8");
+    return file;
+  }
+
+  it("returns the LAST model_change (provider + modelId)", () => {
+    const file = writeSession([
+      JSON.stringify({ type: "session", version: 3, id: "s1" }),
+      JSON.stringify({ type: "model_change", id: "m1", provider: "anthropic", modelId: "claude-sonnet-4-5" }),
+      JSON.stringify({ type: "model_change", id: "m2", provider: "cpa_mybitx", modelId: "mybitx/gpt-5.6-sol" }),
+    ]);
+    assert.deepEqual(subagentsModule.__test__.resolveParentModel(file), {
+      provider: "cpa_mybitx",
+      modelId: "mybitx/gpt-5.6-sol",
+    });
+  });
+
+  it("returns null when the session has no model_change", () => {
+    const file = writeSession([
+      JSON.stringify({ type: "session", version: 3, id: "s1" }),
+      JSON.stringify({ type: "thinking_level_change", id: "t1", thinkingLevel: "xhigh" }),
+    ]);
+    assert.equal(subagentsModule.__test__.resolveParentModel(file), null);
+  });
+
+  it("returns null for a missing/unreadable file", () => {
+    assert.equal(subagentsModule.__test__.resolveParentModel(join(dir, "does-not-exist.jsonl")), null);
+  });
+
+  it("ignores malformed lines but keeps a later valid model_change", () => {
+    const file = writeSession([
+      JSON.stringify({ type: "model_change", id: "m1", provider: "google", modelId: "gemini-pro" }),
+      "{not valid json",
+      JSON.stringify({ type: "model_change", id: "m2", provider: "cpa_arb", modelId: "arb/gpt-x" }),
+    ]);
+    assert.deepEqual(subagentsModule.__test__.resolveParentModel(file), {
+      provider: "cpa_arb",
+      modelId: "arb/gpt-x",
+    });
+  });
+});

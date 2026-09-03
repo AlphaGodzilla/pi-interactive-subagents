@@ -331,6 +331,73 @@ function resolveLaunchBehavior(
   };
 }
 
+interface ParentModelSpec {
+  provider: string;
+  modelId: string;
+}
+
+/**
+ * Resolve the most recent model_change event from the parent session file.
+ *
+ * A subagent launched via `pi --session <child>` only gets a model when the
+ * extension or the agent frontmatter supplies one. Without it pi falls back to
+ * its CLI default provider ("google"), which is unauthenticated on machines
+ * that run custom proxy providers (cpa_mybitx, ...): the child pi then dies
+ * instantly with exit code 1 before writing any session output — the
+ * "subagent aborts 1s after launch" failure mode. Explicitly inheriting the
+ * parent's provider + model makes every launch deterministic.
+ */
+function resolveParentModel(parentSessionFile: string): ParentModelSpec | null {
+  try {
+    const raw = readFileSync(parentSessionFile, "utf8");
+    let provider: string | null = null;
+    let modelId: string | null = null;
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const entry = JSON.parse(trimmed);
+        if (
+          entry?.type === "model_change" &&
+          typeof entry.provider === "string" &&
+          typeof entry.modelId === "string"
+        ) {
+          // Keep walking: the last model_change is the current model.
+          provider = entry.provider;
+          modelId = entry.modelId;
+        }
+      } catch {
+        // ignore malformed lines
+      }
+    }
+    return provider && modelId ? { provider, modelId } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the tail of a pane stripped of ANSI escapes, for failure diagnostics.
+ * Returns "" when the surface is already gone or has no readable output.
+ */
+function readPaneTail(surface: string, lines = 40): string {
+  try {
+    const raw = readScreen(surface, lines);
+    const clean = raw
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][AB0]/g, "")
+      .replace(/\x1b\[[0-9;]*m/g, "");
+    return clean
+      .split("\n")
+      .map((line) => line.trimEnd())
+      .join("\n")
+      .trim();
+  } catch {
+    return "";
+  }
+}
+
 /**
  * Decide whether a subagent is interactive (user-driven, long-running).
  *
@@ -985,6 +1052,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  resolveParentModel,
   runningSubagents,
   formatElapsed,
 };
@@ -1165,6 +1233,23 @@ async function launchSubagent(
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
     parts.push("--model", shellEscape(model));
+  } else {
+    // No explicit model (tool param / agent frontmatter): inherit the parent
+    // session's current model. Without this, pi falls back to its CLI default
+    // provider ("google") — unauthenticated on proxy-only setups — and the
+    // child dies instantly with exit code 1 before writing any session output.
+    const parentModel = resolveParentModel(sessionFile);
+    if (parentModel) {
+      parts.push("--provider", shellEscape(parentModel.provider));
+      parts.push("--model", shellEscape(parentModel.modelId));
+    } else {
+      throw new Error(
+        `No model resolvable for subagent "${params.name}" ` +
+        "(no --model / agent frontmatter model / parent model_change). Set a model on " +
+        "the agent frontmatter (agents/<agent>.md), pass the model tool parameter, " +
+        "or run the parent session with a model.",
+      );
+    }
   }
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
@@ -1394,6 +1479,17 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
+    // Failed launches often die before writing anything to the session file
+    // (e.g. pi CLI model-resolution or provider-auth errors on startup).
+    // Surface the pane's last output so the orchestrator sees the real cause
+    // instead of a bare exit code or "Aborted while waiting" noise.
+    if (result.exitCode !== 0 || result.errorMessage) {
+      const paneTail = readPaneTail(surface);
+      if (paneTail) {
+        summary = `${summary}\n\n--- last subagent pane output ---\n${paneTail}`;
+      }
+    }
+
     closeSurface(surface);
     runningSubagents.delete(running.id);
 
@@ -1408,6 +1504,14 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    // Grab the pane tail BEFORE tearing the surface down: when a child dies at
+    // startup (model resolution, provider auth, ...) the pane is the only
+    // place that records why. Without it the orchestrator only sees the
+    // generic "Aborted while waiting for subagent to finish" message.
+    let paneTail = "";
+    try {
+      paneTail = readPaneTail(surface);
+    } catch {}
     try {
       closeSurface(surface);
     } catch {}
@@ -1417,20 +1521,22 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: paneTail ? `Subagent cancelled.\n\n--- last subagent pane output ---\n${paneTail}` : "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
         sessionFile,
       };
     }
+    const errMessage = err?.message ?? String(err);
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      summary: paneTail ? `Subagent error: ${errMessage}\n\n--- last subagent pane output ---\n${paneTail}` : `Subagent error: ${errMessage}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
+      error: errMessage,
+      sessionFile,
     };
   }
 }
