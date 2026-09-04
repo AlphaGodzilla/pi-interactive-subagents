@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -55,6 +55,7 @@ import {
   findLatestAssistantError,
   resolveSteerPolling,
 } from "../pi-extension/subagents/subagent-done.ts";
+import subagentDoneDefault from "../pi-extension/subagents/subagent-done.ts";
 import {
   appendSteerMessage,
   createSteerPoller,
@@ -1289,6 +1290,99 @@ describe("subagent-done.ts", () => {
     it("returns null when messages is undefined or empty", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
+    });
+  });
+
+  describe("auto-exit defers error exits until agent_settled (pi retry window)", () => {
+    const AUTO_EXIT_KEY = "PI_SUBAGENT_AUTO_EXIT";
+    const SESSION_KEY = "PI_SUBAGENT_SESSION";
+    const NAME_KEY = "PI_SUBAGENT_NAME";
+    let dir: string;
+    let sessionFile: string;
+    const savedEnv = new Map<string, string | undefined>();
+
+    before(() => {
+      for (const key of [AUTO_EXIT_KEY, SESSION_KEY, NAME_KEY]) savedEnv.set(key, process.env[key]);
+      dir = mkdtempSync(join(tmpdir(), "pi-sub-done-"));
+      sessionFile = join(dir, "child.jsonl");
+      writeFileSync(sessionFile, "", "utf8");
+      process.env[AUTO_EXIT_KEY] = "1";
+      process.env[SESSION_KEY] = sessionFile;
+      process.env[NAME_KEY] = "t-child";
+    });
+    after(() => {
+      for (const [key, value] of savedEnv) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    function createHarness() {
+      const handlers = new Map<string, (event?: any, ctx?: any) => void>();
+      const calls: string[] = [];
+      const pi = {
+        on: (name: string, fn: (event?: any, ctx?: any) => void) => handlers.set(name, fn),
+        getAllTools: () => [],
+        registerShortcut: () => {},
+        registerTool: () => {},
+        sendUserMessage: async () => {},
+        sendMessage: async () => {},
+      };
+      const ctx = {
+        shutdown: () => calls.push("shutdown"),
+        ui: { setWidget: () => {} },
+      };
+      subagentDoneDefault(pi as any);
+      return { handlers, ctx, calls };
+    }
+
+    function errorMessage(stopReason: string, errorMessage?: string) {
+      return { role: "assistant", stopReason, errorMessage, content: [] };
+    }
+
+    it("does not exit on the first error agent_end; flushes .exit at agent_settled", () => {
+      const { handlers, ctx, calls } = createHarness();
+      const err = `502: {\"type\":\"api_error\",\"message\":\"Provider timed out\"}`;
+
+      handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("error", err)] }, ctx);
+      assert.deepEqual(calls, [], "must not shut down while pi may still retry");
+      assert.equal(existsSync(sessionFile + ".exit"), false, "no sidecar before the run settles");
+
+      handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+      assert.deepEqual(calls, ["shutdown"]);
+      const sidecar = JSON.parse(readFileSync(sessionFile + ".exit", "utf8"));
+      assert.equal(sidecar.type, "error");
+      assert.equal(sidecar.stopReason, "error");
+      assert.equal(sidecar.errorMessage, err);
+      rmSync(sessionFile + ".exit", { force: true });
+    });
+
+    it("shuts down immediately on a normal (non-error) agent_end", () => {
+      const { handlers, ctx, calls } = createHarness();
+      handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("stop")] }, ctx);
+      assert.deepEqual(calls, ["shutdown"]);
+    });
+
+    it("keeps the session open when the user took over before agent_settled", () => {
+      const { handlers, ctx, calls } = createHarness();
+      handlers.get("agent_start")?.({}, ctx);
+      handlers.get("input")?.({}, ctx); // user takeover
+      handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("error", "boom")] }, ctx);
+      handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+      assert.deepEqual(calls, [], "user takeover must leave the session open");
+      assert.equal(existsSync(sessionFile + ".exit"), false);
+    });
+
+    it("resets the deferred error when a later agent_end completes normally", () => {
+      const { handlers, ctx, calls } = createHarness();
+      handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("error", "transient")] }, ctx);
+      // pi retried and the run then completed normally
+      handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("stop")] }, ctx);
+      assert.deepEqual(calls, ["shutdown"]);
+      handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+      assert.deepEqual(calls, ["shutdown"], "no second exit after settle");
+      assert.equal(existsSync(sessionFile + ".exit"), false, "no error sidecar after a successful retry");
     });
   });
 

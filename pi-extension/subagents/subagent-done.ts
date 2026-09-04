@@ -202,6 +202,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   let userTookOver = false;
+
+  // When the last agent run ends with stopReason="error", pi's agent loop
+  // may still retry it (exponential backoff, settings.retry) AFTER agent_end.
+  // Auto-exit must not shut down on that first error turn — that killed the
+  // child before a single retry could run. Defer the error exit until
+  // agent_settled, which fires once the run (including every retry) is over.
+  let deferredErrorExit: SubagentErrorInfo | null = null;
   let agentStarted = false;
 
   // Show widget + status bar on session start
@@ -237,29 +244,19 @@ export default function (pi: ExtensionAPI) {
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
+      // A stopReason="error" turn is NOT the end of the run: pi's agent loop
+      // retries provider errors with exponential backoff (settings.retry)
+      // AFTER agent_end, before the run settles. Exiting here — as auto-exit
+      // used to — killed the child on the FIRST provider error, so subagents
+      // never got to use pi's retry budget and died on a single transient
+      // 502/5xx. Defer the error exit until agent_settled.
       const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
+      if (errorInfo) {
+        deferredErrorExit = errorInfo;
+        recorder.agentEndWaiting();
+        return;
       }
-
+      deferredErrorExit = null;
       recorder.agentEndDone();
       ctx.shutdown();
       return;
@@ -271,6 +268,36 @@ export default function (pi: ExtensionAPI) {
       // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+  });
+
+  // agent_settled fires once the run is fully over — including every retry the
+  // agent loop took after an error turn (or the immediate end when the error
+  // was not retryable). An error exit still pending here means pi gave up:
+  // surface the real failure to the parent via the .exit sidecar and shut
+  // down. If the user took over the pane meanwhile, leave the session open.
+  pi.on("agent_settled", (event, ctx) => {
+    if (!deferredErrorExit) return;
+    const errorInfo = deferredErrorExit;
+    deferredErrorExit = null;
+    if (userTookOver) return;
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (sessionFile) {
+      try {
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          }),
+        );
+      } catch {
+        // Best effort — even without the sidecar, the watcher's session-file
+        // fallback can still recover the errorMessage.
+      }
+    }
+    recorder.agentEndDone();
+    ctx.shutdown();
   });
 
   pi.on("turn_start", (event) => {
