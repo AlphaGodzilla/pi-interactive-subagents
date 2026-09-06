@@ -35,6 +35,7 @@ Supported multiplexers:
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+- [herdr](https://herdr.dev) (terminal workspace manager for AI coding agents)
 
 Start pi inside one of them:
 
@@ -46,9 +47,11 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm — no wrapper needed
+# or
+herdr   # then run: pi
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|herdr` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -56,7 +59,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
@@ -462,6 +465,7 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
+  - [herdr](https://herdr.dev)
 
 ```bash
 cmux pi
@@ -471,12 +475,14 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm
+# or
+herdr   # then run: pi
 ```
 
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm, herdr
 ```
 
 ---

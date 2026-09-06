@@ -21,6 +21,7 @@ import {
   shellEscape,
   isCmuxAvailable,
   isWezTermAvailable,
+  isHerdrAvailable,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
@@ -2707,6 +2708,13 @@ describe("cmux.ts", () => {
   describe("isWezTermAvailable", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
+      assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("isHerdrAvailable", () => {
+    it("returns boolean based on HERDR_ENV and herdr binary", () => {
+      const result = isHerdrAvailable();
       assert.equal(typeof result, "boolean");
     });
   });

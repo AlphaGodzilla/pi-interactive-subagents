@@ -9,8 +9,9 @@
  *   cmux bash -c 'npm run test:integration'
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
+ *   herdr             # then run: npm run test:integration
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import {
@@ -58,12 +59,23 @@ for (const backend of backends) {
       env = createTestEnv(backend);
     });
 
+    // Close every pane created by the previous test so split-based backends
+    // (tmux, zellij, wezterm, herdr) start each test from a full-width layout.
+    // cmux reuses one pane with tabs and is unaffected, but per-test cleanup
+    // keeps panes from accumulating into ever-narrower splits mid-suite.
+    afterEach(() => {
+      cleanupTestEnv(env);
+    });
+
     after(() => {
       cleanupTestEnv(env);
       restoreBackend(prevMux);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
+    // Focus helpers (focusSurface/getFocusedSurface) exist only for cmux/tmux;
+    // other backends create subagent panes with --no-focus equivalents and are
+    // covered by the non-focus tests below.
+    it("keeps focus on the active surface while creating and targeting subagent surfaces", { skip: !["cmux", "tmux"].includes(backend) }, async () => {
       const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
 

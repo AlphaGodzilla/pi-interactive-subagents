@@ -6,7 +6,7 @@ import { basename, dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -43,7 +43,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "herdr") return pref;
   return null;
 }
 
@@ -63,6 +63,10 @@ function isWezTermRuntimeAvailable(): boolean {
   return !!process.env.WEZTERM_UNIX_SOCKET && hasCommand("wezterm");
 }
 
+function isHerdrRuntimeAvailable(): boolean {
+  return process.env.HERDR_ENV === "1" && hasCommand("herdr");
+}
+
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
 }
@@ -79,17 +83,23 @@ export function isWezTermAvailable(): boolean {
   return isWezTermRuntimeAvailable();
 }
 
+export function isHerdrAvailable(): boolean {
+  return isHerdrRuntimeAvailable();
+}
+
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
   if (pref === "wezterm") return isWezTermRuntimeAvailable() ? "wezterm" : null;
+  if (pref === "herdr") return isHerdrRuntimeAvailable() ? "herdr" : null;
 
   if (isCmuxRuntimeAvailable()) return "cmux";
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (isHerdrRuntimeAvailable()) return "herdr";
   return null;
 }
 
@@ -111,7 +121,10 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  if (pref === "herdr") {
+    return "Start pi inside herdr (`herdr`, then run `pi`).";
+  }
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or herdr (`herdr`, then run `pi`).";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -776,9 +789,13 @@ export function createSurface(name: string): string {
     return createZellijSurface(name);
   }
 
-  // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
+  // On tmux/herdr, target the parent pi's pane so splits follow the agent, not the user's focus.
   // See https://github.com/HazAT/pi-interactive-subagents/issues/12
-  const fromSurface = backend === "tmux" ? process.env.TMUX_PANE : undefined;
+  const fromSurface = backend === "tmux"
+    ? process.env.TMUX_PANE
+    : backend === "herdr"
+      ? process.env.HERDR_PANE_ID
+      : undefined;
   return createSurfaceSplit(name, "right", fromSurface);
 }
 
@@ -844,6 +861,43 @@ export function createSurfaceSplit(
     }
 
     return pane;
+  }
+
+  if (backend === "herdr") {
+    // herdr only supports right|down splits (no left/up, no before-placement).
+    const directionArg = direction === "left" || direction === "right" ? "right" : "down";
+    const args = ["pane", "split"];
+    if (fromSurface) {
+      args.push("--pane", fromSurface);
+    } else if (process.env.HERDR_PANE_ID) {
+      args.push("--pane", process.env.HERDR_PANE_ID);
+    } else {
+      args.push("--current");
+    }
+    args.push("--direction", directionArg);
+    args.push("--cwd", process.cwd());
+    args.push("--no-focus");
+
+    const output = execFileSync("herdr", args, { encoding: "utf8" }).trim();
+    let parsed: any;
+    try {
+      parsed = JSON.parse(output);
+    } catch {
+      throw new Error(`Unexpected herdr pane split output: ${output || "(empty)"}`);
+    }
+    const paneId = parsed?.result?.pane?.pane_id;
+    if (typeof paneId !== "string" || !paneId) {
+      throw new Error(`Unexpected herdr pane split output: ${output}`);
+    }
+
+    // Label the pane (cosmetic).
+    try {
+      execFileSync("herdr", ["pane", "rename", paneId, name], { encoding: "utf8" });
+    } catch {
+      // Optional.
+    }
+
+    return paneId;
   }
 
   if (backend === "wezterm") {
@@ -941,6 +995,15 @@ export function renameCurrentTab(title: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // herdr subagents are split panes, not tabs — rename the agent's own pane.
+    const paneId = process.env.HERDR_PANE_ID;
+    if (paneId) {
+      execFileSync("herdr", ["pane", "rename", paneId, title], { encoding: "utf8" });
+    }
+    return;
+  }
+
   // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
   // rename-tab clobbers the user's tab title whenever a subagent starts.
   // Closes #21.
@@ -996,6 +1059,13 @@ export function renameWorkspace(title: string): void {
     return;
   }
 
+  if (backend === "herdr") {
+    // Skip workspace rename for herdr: pi titles often contain special
+    // characters and renaming the workspace provides little user-visible value
+    // over pane/tab renaming (handled separately).
+    return;
+  }
+
   // Skip session rename for zellij. rename-session renames the socket file
   // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
   // name, so all subsequent `zellij action ...` CLI calls fail with
@@ -1021,6 +1091,11 @@ export function sendCommand(surface: string, command: string): void {
   if (backend === "tmux") {
     execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
     execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "run", surface, command], { encoding: "utf8" });
     return;
   }
 
@@ -1050,6 +1125,11 @@ export function sendEscape(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["send-keys", "-t", surface, "Escape"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "send-keys", surface, "esc"], { encoding: "utf8" });
     return;
   }
 
@@ -1123,6 +1203,21 @@ export function readScreen(surface: string, lines = 50): string {
     );
   }
 
+  if (backend === "herdr") {
+    // `recent-unwrapped` joins soft wraps so long lines survive narrow split
+    // panes; `visible` returns raw viewport rows, which can cut a marker in
+    // half. Fall back to `visible` when the recent buffer is still empty.
+    const lineArg = String(Math.max(1, lines));
+    const readPane = (source: string) =>
+      execFileSync(
+        "herdr",
+        ["pane", "read", surface, "--source", source, "--lines", lineArg],
+        { encoding: "utf8" },
+      );
+    const recent = readPane("recent-unwrapped");
+    return recent.trim() ? recent : readPane("visible");
+  }
+
   if (backend === "wezterm") {
     const raw = execFileSync(
       "wezterm",
@@ -1168,6 +1263,20 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return stdout;
   }
 
+  if (backend === "herdr") {
+    const lineArg = String(Math.max(1, lines));
+    const readPane = (source: string) =>
+      execFileAsync(
+        "herdr",
+        ["pane", "read", surface, "--source", source, "--lines", lineArg],
+        { encoding: "utf8" },
+      );
+    const { stdout: recent } = await readPane("recent-unwrapped");
+    if (recent.trim()) return recent;
+    const { stdout: visible } = await readPane("visible");
+    return visible;
+  }
+
   if (backend === "wezterm") {
     const { stdout } = await execFileAsync(
       "wezterm",
@@ -1202,6 +1311,11 @@ export function closeSurface(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "close", surface], { encoding: "utf8" });
     return;
   }
 
