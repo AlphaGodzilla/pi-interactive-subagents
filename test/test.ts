@@ -1725,6 +1725,29 @@ describe("subagent interruption", () => {
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_interrupt"), true);
   });
 
+  it("documents the id-vs-name targeting rules in interrupt and steer tool descriptions", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    for (const toolName of ["subagent_interrupt", "subagent_steer"]) {
+      const tool = registeredTools.find((t) => t.name === toolName);
+      assert.ok(tool, `${toolName} registered`);
+      // The id parameter must be described as the internal 8-hex id, and the
+      // description must steer callers to the name field when the id is unknown
+      // (models historically copied the display name into the id field).
+      assert.match(tool.description, /8-hex id/);
+      assert.match(tool.description, /Never put a display name into the id/);
+      assert.match(tool.promptSnippet, /display name as id|name-as-id/);
+    }
+
+    const spawnTool = registeredTools.find((t) => t.name === "subagent");
+    assert.match(spawnTool.description, /\[id /);
+    assert.match(spawnTool.promptSnippet, /\[id /);
+
+    const listTool = registeredTools.find((t) => t.name === "subagents_list");
+    assert.match(listTool.description, /NOT.*currently running/);
+  });
+
   it("resolves interrupt targets by exact id and reports name ambiguity", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -1745,6 +1768,66 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("falls back to display-name matching when the id field carries a name", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "reviewer-flyway-v110-v111-repair" }));
+
+      // Models copy the display name into the id field when the internal hex
+      // id is unknown (the historical failure mode).
+      const viaIdAsName = testApi.resolveInterruptTarget({ id: "reviewer-flyway-v110-v111-repair" });
+      assert.equal(viaIdAsName.running.id, "a1");
+
+      const viaBoth = testApi.resolveInterruptTarget({
+        id: "reviewer-flyway-v110-v111-repair",
+        name: "reviewer-flyway-v110-v111-repair",
+      });
+      assert.equal(viaBoth.running.id, "a1");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reports ambiguity and lists candidates when name-as-id matches several running subagents", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "a1" }));
+      runningMap.set("b2", makeRunning({ id: "b2", name: "Worker", surface: "b2" }));
+
+      const ambiguous = testApi.resolveInterruptTarget({ id: "Worker" });
+      assert.match(ambiguous.error, /Ambiguous subagent name/);
+      assert.match(ambiguous.error, /\[a1\]/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("lists running candidates when the target cannot be resolved", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "a1" }));
+
+      const missing = testApi.resolveInterruptTarget({ id: "zzz" });
+      assert.match(missing.error, /No running subagent with id "zzz"/);
+      assert.match(missing.error, /Running subagents:/);
+      assert.match(missing.error, /"Worker" \[id a1\]/);
+
+      const missingByName = testApi.resolveInterruptTarget({ name: "Ghost" });
+      assert.match(missingByName.error, /No running subagent named "Ghost"/);
+      assert.match(missingByName.error, /Running subagents:/);
+    } finally {
+      runningMap.clear();
+    }
+  });
   it("returns an explicit error when Escape delivery fails", () => {
     const testApi = (subagentsModule as any).__test__;
     let aborted = false;

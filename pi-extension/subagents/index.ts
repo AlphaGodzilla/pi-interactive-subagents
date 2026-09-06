@@ -840,13 +840,38 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   }, observedAt);
 }
 
+function listRunningSubagentTargets(): string {
+  const targets = Array.from(runningSubagents.values());
+  if (targets.length === 0) return "";
+  return targets.map((running) => `"${running.name}" [id ${running.id}]`).join(", ");
+}
+
+function matchRunningByName(name: string): { running: RunningSubagent } | { error: string } | null {
+  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === name);
+  if (matches.length === 1) return { running: matches[0] };
+  if (matches.length === 0) return null;
+  const candidates = matches.map((running) => `${running.name} [${running.id}]`).join(", ");
+  return { error: `Ambiguous subagent name "${name}". Matches: ${candidates}` };
+}
+
 function resolveInterruptTarget(params: { id?: string; name?: string }):
   | { running: RunningSubagent }
   | { error: string } {
   const requestedId = params.id?.trim();
   if (requestedId) {
     const running = runningSubagents.get(requestedId);
-    return running ? { running } : { error: `No running subagent with id "${requestedId}".` };
+    if (running) return { running };
+
+    // Callers (the model, or users copying the name from the widget/spawn
+    // result) often pass the display name in the `id` field when the internal
+    // hex id is unknown. Fall back to a display-name match before giving up so
+    // interrupt/steer work with name-as-id arguments too.
+    const byDisplayName = matchRunningByName(requestedId);
+    if (byDisplayName) return byDisplayName;
+
+    const runningList = listRunningSubagentTargets();
+    const hint = runningList ? ` Running subagents: ${runningList}.` : "";
+    return { error: `No running subagent with id "${requestedId}".${hint}` };
   }
 
   const requestedName = params.name?.trim();
@@ -854,14 +879,12 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
     return { error: "Provide a running subagent id or exact display name." };
   }
 
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
-  if (matches.length === 1) return { running: matches[0] };
-  if (matches.length === 0) {
-    return { error: `No running subagent named "${requestedName}".` };
-  }
+  const byName = matchRunningByName(requestedName);
+  if (byName) return byName;
 
-  const candidates = matches.map((running) => `${running.name} [${running.id}]`).join(", ");
-  return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
+  const runningList = listRunningSubagentTargets();
+  const hint = runningList ? ` Running subagents: ${runningList}.` : "";
+  return { error: `No running subagent named "${requestedName}".${hint}` };
 }
 
 function requestSubagentInterrupt(
@@ -1620,14 +1643,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "The launch acknowledgement shows the subagent's internal id, e.g. `Sub-agent \"Worker\" [id a1b2c3d4] launched` — " +
+        "keep that id in mind if you may need to interrupt (subagent_interrupt) or steer (subagent_steer) it later.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Spawn a background sub-agent in a mux pane (fire-and-forget: results arrive automatically, never poll). " +
+        "Keep the returned id — `Sub-agent \"Name\" [id a1b2c3d4] launched` — to interrupt (subagent_interrupt) or steer (subagent_steer) it later.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1739,7 +1760,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
+                `Sub-agent "${params.name}" [id ${running.id}] launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
@@ -1819,16 +1840,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Send Escape to the active turn of a currently running Pi-backed subagent, cancelling its in-flight model turn " +
+        "(including the current tool execution). Turn-level only: the child pane, session, watcher and running entry " +
+        "remain alive; after the interrupt the child sits in `waiting` and its completion/failure still arrives later as usual.\n" +
+        "\nHOW TO TARGET THE SUBAGENT:\n" +
+        "- id (preferred): the 8-hex id from the spawn result, e.g. `Sub-agent \"x\" [id a1b2c3d4] launched`. Unique and unambiguous.\n" +
+        "- name (fallback): the exact display name used at spawn, when the id is unknown. Names are not guaranteed " +
+        "  unique; an ambiguous name is rejected with the list of candidates.\n" +
+        "- Never put a display name into the id parameter — id accepts only the 8-hex internal id.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+        "Interrupt the active turn of a running subagent. Target it by the [id ...] from its spawn result (preferred) or by its display name in name — never pass the display name as id.",
+      promptGuidelines: [
+        "Use subagent_interrupt to cancel a running subagent's current turn: pass the 8-hex id from its spawn result (the `[id a1b2c3d4]` in `Sub-agent ... launched`) in the id parameter; if you only remember the display name, pass it in the name parameter — never in id.",
+      ],
       parameters: Type.Object({
-        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
-        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        id: Type.Optional(Type.String({ description: "Internal id (8-hex, shown in the spawn result as [id ...]). If unknown, put the display name in the name field instead." })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name; the name field is the reliable way to target a subagent when its internal id is unknown." })),
       }),
 
       async execute(_toolCallId, params) {
@@ -1871,26 +1898,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_steer",
       label: "Steer Subagent",
       description:
-        "Send a steering message to a currently running Pi-backed subagent. " +
-        "The message is delivered into the subagent's session as a user message: " +
-        "if the subagent is mid-turn it interrupts after the current tool execution, " +
-        "if it is idle it starts a new turn. " +
-        "Delivery is asynchronous (the child polls its inbox ~every 500ms) and does not emit a subagent_result " +
-        "just because the message was queued. " +
-        "The child pane, session, watcher, and running entry remain alive. " +
-        "Claude Code-backed subagents are not supported yet; use subagent_interrupt or wait for the result instead.",
+        "Queue a steering message for a currently running Pi-backed subagent. The child drains its inbox and injects " +
+        "the message as a user message: if the subagent is mid-turn it interrupts after the current tool execution, " +
+        "if it is idle it starts a new turn. Delivery is asynchronous (the child polls its inbox ~every 500ms); " +
+        "queuing returns immediately and does not emit a subagent_result by itself.\n" +
+        "To simply cancel the current turn WITHOUT adding a message, use subagent_interrupt instead.\n" +
+        "\nHOW TO TARGET THE SUBAGENT (same rules as subagent_interrupt):\n" +
+        "- id (preferred): the 8-hex id from the spawn result, e.g. `Sub-agent \"x\" [id a1b2c3d4] launched`.\n" +
+        "- name (fallback): the exact display name used at spawn, when the id is unknown (not guaranteed unique).\n" +
+        "- Never put a display name into the id parameter — id accepts only the 8-hex internal id.",
       promptSnippet:
-        "Send a steering message to a currently running Pi-backed subagent. " +
-        "The message is delivered into the subagent's session as a user message: " +
-        "if the subagent is mid-turn it interrupts after the current tool execution, " +
-        "if it is idle it starts a new turn. " +
-        "Delivery is asynchronous (the child polls its inbox ~every 500ms) and does not emit a subagent_result " +
-        "just because the message was queued. " +
-        "The child pane, session, watcher, and running entry remain alive. " +
-        "Claude Code-backed subagents are not supported yet; use subagent_interrupt or wait for the result instead.",
+        "Queue a steering message for a running subagent (delivered as a user message, async). Target it by the [id ...] from its spawn result (preferred) or its display name in name — never name-as-id. Use subagent_interrupt to cancel a turn without messaging.",
       parameters: Type.Object({
-        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
-        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+        id: Type.Optional(Type.String({ description: "Internal id (8-hex, shown in the spawn result as [id ...]). If unknown, put the display name in the name field instead." })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name; the name field is the reliable way to target a subagent when its internal id is unknown." })),
         message: Type.String({ description: "The steering message to deliver to the subagent" }),
       }),
 
@@ -1934,13 +1955,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List the AVAILABLE subagent templates (worker, scout, reviewer, researcher, ...) that can be passed to the " +
+        "subagent tool's agent parameter. Scans project-local .pi/agents/ and global ~/.pi/agent/agents/; project-local " +
+        "agents override global ones with the same name. " +
+        "This does NOT report which subagents are currently running — spawned subagents deliver their result " +
+        "automatically when they finish, so never poll this (or anything else) to check on a running subagent.",
       promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List available subagent templates for the subagent tool's agent parameter (NOT a status check — running subagents deliver results automatically).",
       parameters: Type.Object({}),
 
       async execute() {
@@ -1990,19 +2011,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Resume a previous sub-agent session in a new multiplexer pane — use it to re-attach to a cancelled/orphaned " +
+        "sub-agent or to give a finished one follow-up work (the session path is printed in the subagent's result " +
+        "message: `Session: <path>` / `Resume: pi --session <path>`). " +
+        "Fire-and-forget: the call returns immediately; when the resumed session finishes, its result arrives " +
+        "automatically as a steer message. Never poll for status. " +
+        "The name parameter here is only the terminal tab label — it does NOT select a running subagent.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+        "Resume a previous sub-agent session (from the `Session:` path in its result) in a new mux pane; fire-and-forget, results arrive automatically.",
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(

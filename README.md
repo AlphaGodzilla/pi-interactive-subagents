@@ -190,6 +190,11 @@ Use `subagent_interrupt` to cancel the active turn of a running Pi-backed subage
 subagent_interrupt({ id: "abcd1234" });
 // or
 subagent_interrupt({ name: "Scout" });
+
+**Targeting rules (`subagent_interrupt` and `subagent_steer` are the same):**
+- `id` is the **internal 8-hex id** shown in the spawn acknowledgement — `Sub-agent "Worker" [id a1b2c3d4] launched`. Prefer it; it is unique.
+- `name` is the **display name** used at spawn. Use it when the id is unknown — names are not guaranteed unique, and an ambiguous name is rejected with the candidate list.
+- **Never put a display name into the `id` field**; an unmatched id falls back to a display-name match, but passing the name via `name` is the unambiguous form.
 ```
 
 This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
