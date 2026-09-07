@@ -2085,6 +2085,114 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
+
+  it("registers subagent_cleanup in the main session extension", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    assert.equal(registeredTools.some((tool) => tool.name === "subagent_cleanup"), true);
+  });
+
+  it("cleans stalled entries but leaves active ones when no target is given", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closedSurfaces: string[] = [];
+    const aborted: string[] = [];
+    runningMap.clear();
+
+    try {
+      // Stalled: created long ago with no activity snapshot ever observed.
+      runningMap.set("s1", makeRunning({
+        id: "s1",
+        name: "Zombie1",
+        surface: "pane-s1",
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+        abortController: { abort: () => aborted.push("s1") },
+      }));
+      runningMap.set("s2", makeRunning({
+        id: "s2",
+        name: "Zombie2",
+        surface: "pane-s2",
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+        abortController: { abort: () => aborted.push("s2") },
+      }));
+      // Active: has a fresh present snapshot.
+      const activeState = observeStatus(
+        createStatusState({ source: "pi", startTimeMs: 0 }),
+        { snapshot: "present", updatedAt: 100_000, sequence: 1, phase: "active", active: true, activeScope: "tool", activeSince: 100_000, activityLabel: "bash" },
+        100_000,
+      );
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "Worker",
+        surface: "pane-a1",
+        statusState: activeState,
+        abortController: { abort: () => aborted.push("a1") },
+      }));
+
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup({}, (surface: string) => closedSurfaces.push(surface)),
+      );
+
+      assert.deepEqual(closedSurfaces.sort(), ["pane-s1", "pane-s2"]);
+      assert.deepEqual(aborted.sort(), ["s1", "s2"]);
+      assert.equal(runningMap.has("s1"), false);
+      assert.equal(runningMap.has("s2"), false);
+      assert.equal(runningMap.has("a1"), true);
+      assert.equal(result.details.count, 2);
+      assert.match(result.content[0].text, /Cleaned up 2 stalled subagents/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("force-cleans a specified target regardless of status", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closedSurfaces: string[] = [];
+    runningMap.clear();
+
+    try {
+      const activeState = observeStatus(
+        createStatusState({ source: "pi", startTimeMs: 0 }),
+        { snapshot: "present", updatedAt: 100_000, sequence: 1, phase: "active", active: true, activeScope: "tool", activeSince: 100_000, activityLabel: "bash" },
+        100_000,
+      );
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "pane-a1", statusState: activeState }));
+
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup({ id: "a1" }, (surface: string) => closedSurfaces.push(surface)),
+      );
+
+      assert.deepEqual(closedSurfaces, ["pane-a1"]);
+      assert.equal(runningMap.has("a1"), false);
+      assert.equal(result.details.status, "cleaned");
+      assert.match(result.content[0].text, /forced subagent/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reports when there is nothing stalled to clean", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closedSurfaces: string[] = [];
+    runningMap.clear();
+
+    try {
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup({}, (surface: string) => closedSurfaces.push(surface)),
+      );
+      assert.match(result.content[0].text, /No stalled subagents to clean up/);
+      assert.equal(closedSurfaces.length, 0);
+
+      const missing = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup({ id: "zzz" }, (surface: string) => closedSurfaces.push(surface)),
+      );
+      assert.match(missing.content[0].text, /No running subagent/);
+    } finally {
+      runningMap.clear();
+    }
+  });
 });
 
 describe("steering messages", () => {

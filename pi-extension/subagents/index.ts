@@ -189,6 +189,7 @@ const SPAWNING_TOOLS = new Set([
   "subagents_list",
   "subagent_resume",
   "subagent_steer",
+  "subagent_cleanup",
 ]);
 
 /**
@@ -1020,6 +1021,82 @@ function handleSubagentSteer(
   };
 }
 
+/**
+ * Clean up dead/orphaned subagent entries: closes their panes and removes
+ * them from the running registry. Use when a subagent never made it into pi
+ * (empty pane left behind) or died without a watcher-detected exit, leaving a
+ * permanent `stalled` entry in the widget.
+ *
+ * - With id/name: force-clean that one subagent regardless of its status
+ *   (its pane is closed and its pending result is abandoned).
+ * - Without: clean every entry currently classified as `stalled`.
+ */
+function handleSubagentCleanup(
+  params: { id?: string; name?: string },
+  closeSurfaceFn: (surface: string) => void = closeSurface,
+) {
+  const now = Date.now();
+  const targets: RunningSubagent[] = [];
+
+  const requestedId = params.id?.trim();
+  const requestedName = params.name?.trim();
+  if (requestedId || requestedName) {
+    const resolved = resolveInterruptTarget({ id: requestedId || undefined, name: requestedName || undefined });
+    if ("error" in resolved) {
+      return {
+        content: [{ type: "text" as const, text: resolved.error }],
+        details: { error: resolved.error },
+      };
+    }
+    targets.push(resolved.running);
+  } else {
+    for (const running of runningSubagents.values()) {
+      if (classifyStatus(running.statusState, now).kind === "stalled") targets.push(running);
+    }
+  }
+
+  if (targets.length === 0) {
+    const scope = requestedId || requestedName
+      ? `No running subagent matches "${requestedId || requestedName}".`
+      : "No stalled subagents to clean up.";
+    return {
+      content: [{ type: "text" as const, text: scope }],
+      details: { cleaned: [] },
+    };
+  }
+
+  const cleaned = targets.map((running) => {
+    // Abort the watcher so its poll loop unwinds via the cancelled path
+    // (it also closes the surface as best effort); the surface close below is
+    // idempotent. The watcher's completion then reports "cancelled" to the
+    // parent session, which is the expected acknowledgement of a cleanup.
+    try {
+      running.abortController?.abort();
+    } catch {}
+    try {
+      closeSurfaceFn(running.surface);
+    } catch {}
+    runningSubagents.delete(running.id);
+    return { id: running.id, name: running.name, surface: running.surface };
+  });
+
+  updateWidget();
+
+  const label = cleaned.map((c) => `"${c.name}" [${c.id}]`).join(", ");
+  const forced = requestedId || requestedName ? "forced " : "stalled ";
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `Cleaned up ${cleaned.length} ${forced}subagent${cleaned.length > 1 ? "s" : ""}: ${label}. ` +
+          "Panes closed and running entries removed.",
+      },
+    ],
+    details: { cleaned, count: cleaned.length, status: "cleaned" },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1096,6 +1173,7 @@ export const __test__ = {
   requestSubagentInterrupt,
   handleSubagentInterrupt,
   handleSubagentSteer,
+  handleSubagentCleanup,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   resolveParentModel,
@@ -1944,6 +2022,61 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_cleanup tool ──
+  if (shouldRegister("subagent_cleanup"))
+    pi.registerTool({
+      name: "subagent_cleanup",
+      label: "Clean Up Subagents",
+      description:
+        "Clean up dead/orphaned subagent entries: closes their panes and removes them from the running registry. " +
+        "Use when a subagent never made it into pi (only an empty pane was left behind) or died in a way the watcher " +
+        "did not detect, leaving a permanent `stalled` entry in the widget that interrupt/steer cannot reach.\n" +
+        "\nTARGETING:\n" +
+        "- No id/name: clean every entry currently classified as `stalled` (safe default; active/waiting subagents are untouched).\n" +
+        "- id or name (optional): force-clean that one subagent regardless of its status — its pane is closed and any " +
+        "  pending result is abandoned. Targeting rules are the same as subagent_interrupt (8-hex id preferred, " +
+        "  display name via the name field).\n" +
+        "The cleaned subagent's watcher reports `cancelled` to you as the acknowledgement.",
+      promptSnippet:
+        "Clean up dead subagents: no args removes all `stalled` entries (closing their panes); pass id/name to force-remove one entry regardless of status.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Internal id (8-hex) of the subagent to force-clean; omit to clean all stalled entries" })),
+        name: Type.Optional(Type.String({ description: "Display name of the subagent to force-clean (when the id is unknown)" })),
+      }),
+
+      async execute(_toolCallId, params) {
+        return handleSubagentCleanup(params);
+      },
+
+      renderCall(args, theme) {
+        const target = args.id ? `${args.id}` : args.name ? `${args.name}` : "stalled";
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold(target)) +
+            theme.fg("dim", " — cleanup"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.status === "cleaned") {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(String(details.count ?? ""))) +
+              theme.fg("dim", " — cleaned"),
+            0,
+            0,
+          );
+        }
         const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
