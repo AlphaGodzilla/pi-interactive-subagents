@@ -451,11 +451,11 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+Shift+J`:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
+[scout] — 12 tools · 4 denied  (Ctrl+Shift+J)          ← collapsed
+[scout] — 12 available  (Ctrl+Shift+J to collapse)   ← expanded
   read, bash, edit, write, todo, ...
   denied: subagent, subagents_list, ...
 ```
