@@ -1329,6 +1329,110 @@ export function closeSurface(surface: string): void {
   zellijActionSync(["close-pane"], surface);
 }
 
+/**
+ * Enumerate every pane surface that still exists in the multiplexer,
+ * independent of the in-memory registry. Used to tell whether a tracked
+ * subagent's pane is still open. Backend-agnostic: every supported mux can
+ * list its panes; unparseable or unsupported backends return [].
+ */
+export function listAllSurfaces(): string[] {
+  const backend = getMuxBackend();
+  if (!backend) return [];
+
+  try {
+    if (backend === "herdr") {
+      const parsed = JSON.parse(execFileSync("herdr", ["pane", "list"], { encoding: "utf8" }));
+      const panes = parsed?.result?.panes;
+      if (!Array.isArray(panes)) return [];
+      return panes.filter((p) => typeof p?.pane_id === "string").map((p) => p.pane_id);
+    }
+
+    if (backend === "tmux") {
+      const raw = execFileSync("tmux", ["list-panes", "-a", "-F", "#{pane_id}"], { encoding: "utf8" });
+      return raw.split("\n").map((s) => s.trim()).filter((s) => s.startsWith("%"));
+    }
+
+    if (backend === "wezterm") {
+      const raw = execFileSync("wezterm", ["cli", "list", "--format", "json"], { encoding: "utf8" });
+      const panes = JSON.parse(raw);
+      if (!Array.isArray(panes)) return [];
+      return panes.filter((p) => typeof p?.pane_id === "string").map((p) => p.pane_id);
+    }
+
+    if (backend === "cmux") {
+      // cmux tree renders every surface; collect the surface tokens.
+      const raw = execSync("cmux tree", { encoding: "utf8" });
+      const found = [...raw.matchAll(/surface:\d+/g)].map((m) => m[0]);
+      return [...new Set(found)];
+    }
+
+    if (backend === "zellij") {
+      // zellij action query-pane-names prints "<tab_id>:<pane_id>:<name>" rows
+      // (name empty for unnamed panes). Surface ids are pane:N.
+      const raw = zellijActionSync(["query-pane-names"]);
+      return raw
+        .split("\n")
+        .map((line) => {
+          const m = line.trim().match(/^\d+:\d+/);
+          return m ? `pane:${m[0].split(":")[1]}` : null;
+        })
+        .filter((s): s is string => !!s);
+    }
+  } catch {
+    // Backend unavailable or command unsupported — caller falls back to the
+    // registry-only view.
+  }
+  return [];
+}
+
+/**
+ * List panes the orchestrator itself created and named for subagents that are
+ * still present in the multiplexer but have NO running entry anymore (e.g.
+ * left behind by a session that restarted, or a launch that never started pi).
+ *
+ * Naming/labelling ability differs per backend:
+ * - herdr: panes are labelled with the subagent name (`pane rename`).
+ * - zellij: tabs/panes are renamed to the subagent name.
+ * - cmux: surfaces are renamed to the subagent name (`rename-tab`); the tree
+ *   text does not reliably expose names, so discovery is best-effort.
+ * - tmux / wezterm: panes have no name concept we set at creation — orphan
+ *   pane discovery is unavailable; rely on process-based discovery instead.
+ */
+export function listSubagentPanes(): Array<{ surface: string; label: string }> {
+  const backend = getMuxBackend();
+  if (!backend) return [];
+
+  try {
+    if (backend === "herdr") {
+      const parsed = JSON.parse(execFileSync("herdr", ["pane", "list"], { encoding: "utf8" }));
+      const panes = parsed?.result?.panes;
+      if (!Array.isArray(panes)) return [];
+      return panes
+        .filter((p) => typeof p?.pane_id === "string" && typeof p?.label === "string" && p.label.trim() !== "")
+        .map((p) => ({ surface: p.pane_id, label: p.label }));
+    }
+
+    if (backend === "zellij") {
+      const raw = zellijActionSync(["query-pane-names"]);
+      return raw
+        .split("\n")
+        .map((line) => {
+          const m = line.trim().match(/^(\d+):(\d+):(.+)$/);
+          if (!m) return null;
+          const name = m[3];
+          return name ? { surface: `pane:${m[2]}`, label: name } : null;
+        })
+        .filter((s): s is { surface: string; label: string } | null => !!s) as Array<{
+        surface: string;
+        label: string;
+      }>;
+    }
+  } catch {
+    // Unsupported or unparseable — orphan pane discovery unavailable.
+  }
+  return [];
+}
+
 export interface PollResult {
   /** How the subagent exited */
   reason: "done" | "ping" | "sentinel" | "error";

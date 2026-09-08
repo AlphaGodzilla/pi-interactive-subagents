@@ -2092,6 +2092,114 @@ describe("subagent interruption", () => {
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_cleanup"), true);
   });
 
+  it("registers subagents_status in the main session extension", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((t) => t.name === "subagents_status");
+    assert.ok(tool);
+    assert.match(tool.description, /NOT the same as subagents_list/);
+  });
+
+  it("lists running subagents with ids and live status", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      const activeState = observeStatus(
+        createStatusState({ source: "pi", startTimeMs: 5_000 }),
+        { snapshot: "present", updatedAt: 100_000, sequence: 1, phase: "active", active: true, activeScope: "tool", activeSince: 100_000, activityLabel: "bash" },
+        100_000,
+      );
+      runningMap.set("a1", makeRunning({
+        id: "a1",
+        name: "Worker",
+        task: "fix the API tests",
+        surface: "pane-a1",
+        statusState: activeState,
+      }));
+      runningMap.set("z9", makeRunning({
+        id: "z9",
+        name: "Zombie",
+        surface: "pane-z9",
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      }));
+
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentsStatus({
+          listAllSurfacesFn: () => ["pane-a1", "pane-z9"],
+          listNamedPanesFn: () => [],
+          discoverOrphansFn: () => [],
+        }),
+      );
+
+      assert.equal(result.details.count, 2);
+      assert.equal(result.details.entries[0].id, "a1");
+      assert.equal(result.details.entries[0].kind, "active");
+      assert.equal(result.details.entries[0].activityLabel, "bash");
+      assert.equal(result.details.entries[0].paneOpen, true);
+      assert.equal(result.details.entries[1].id, "z9");
+      assert.equal(result.details.entries[1].kind, "stalled");
+      assert.equal(result.details.entries[1].paneOpen, true);
+      assert.match(result.content[0].text, /Worker \[a1\]/);
+      assert.match(result.content[0].text, /Zombie \[z9\]/);
+      assert.match(result.content[0].text, /2 subagents \(2 tracked, 0 orphan\)/);
+      assert.match(result.content[0].text, /fix the API tests/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reports no running subagents when the registry is empty", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentsStatus({
+          listAllSurfacesFn: () => [],
+          listNamedPanesFn: () => [],
+          discoverOrphansFn: () => [],
+        }),
+      );
+      assert.match(result.content[0].text, /No subagents or subagent panes found/);
+      assert.equal(result.details.count, 0);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reports orphan pi processes and orphan named panes alongside tracked entries", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "pane-a1", statusState: createStatusState({ source: "pi", startTimeMs: 100_000 }) }));
+
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentsStatus({
+          listAllSurfacesFn: () => ["pane-a1", "w4:pK"],
+          listNamedPanesFn: () => [{ surface: "w4:pK", label: "Sumsub研究" }],
+          discoverOrphansFn: (tracked) => [
+            { pid: "4242", id: "deadbeef", name: "ghost-reviewer", surface: "pane-99" },
+          ],
+        }),
+      );
+
+      const text = result.content[0].text;
+      assert.match(text, /\(1 tracked, 2 orphan\)/);
+      assert.match(text, /ghost-reviewer \[orphan deadbeef\]/);
+      assert.match(text, /pid 4242/);
+      assert.match(text, /Sumsub研究 \[orphan pane w4:pK\]/);
+      assert.equal(result.details.entries.length, 3);
+      const orphanKinds = result.details.entries.map((e: any) => e.origin).sort();
+      assert.deepEqual(orphanKinds, ["orphan-pane", "orphan-process", "registry"]);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
   it("cleans stalled entries but leaves active ones when no target is given", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;

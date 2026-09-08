@@ -3,6 +3,7 @@ import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -21,6 +22,8 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  listSubagentPanes,
+  listAllSurfaces,
   getMuxBackend,
   sendEscape,
   shellEscape,
@@ -190,6 +193,7 @@ const SPAWNING_TOOLS = new Set([
   "subagent_resume",
   "subagent_steer",
   "subagent_cleanup",
+  "subagents_status",
 ]);
 
 /**
@@ -1097,6 +1101,197 @@ function handleSubagentCleanup(
   };
 }
 
+interface OrphanProcess {
+  pid: string;
+  id: string;
+  name: string;
+  surface: string | null;
+}
+
+/**
+ * Discover subagent pi processes that are alive but whose running entry is no
+ * longer tracked (e.g. the orchestrator session restarted, or the watcher
+ * never picked them up). Backend-agnostic: every pi subagent is launched with
+ * PI_SUBAGENT_ID / PI_SUBAGENT_NAME / PI_SUBAGENT_SURFACE in its environment,
+ * visible via `ps eww`.
+ */
+function discoverOrphanSubagentProcesses(
+  trackedIds: ReadonlySet<string>,
+  sessionDir: string | null,
+): OrphanProcess[] {
+  try {
+    const out = execSync("ps eww -axo pid=,command=", {
+      encoding: "utf8",
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    const byId = new Map<string, OrphanProcess>();
+    for (const line of out.split("\n")) {
+      const m = line.match(/^\s*(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const idMatch = m[2].match(/PI_SUBAGENT_ID=([0-9a-fA-F]{6,16})/);
+      if (!idMatch) continue;
+      const id = idMatch[1].toLowerCase();
+      if (trackedIds.has(id)) continue;
+      // Only report subagents launched under THIS orchestrator's session
+      // directory — subagents of other pi sessions (other projects or other
+      // windows over the same project) live in different session dirs.
+      const sessionMatch = m[2].match(/PI_SUBAGENT_SESSION=(\S+)/);
+      if (sessionDir) {
+        if (!sessionMatch) continue;
+        let childDir: string | null = null;
+        try {
+          childDir = dirname(sessionMatch[1]);
+        } catch {}
+        if (childDir !== sessionDir) continue;
+      }
+      // Names are launch slugs and rarely contain spaces; surface is optional
+      // (env output can be truncated on some platforms).
+      const nameMatch = m[2].match(/PI_SUBAGENT_NAME=(\S+)/);
+      const surfaceMatch = m[2].match(/PI_SUBAGENT_SURFACE=(\S+)/);
+      byId.set(id, {
+        pid: m[1],
+        id,
+        name: nameMatch?.[1] ?? `subagent-${id}`,
+        surface: surfaceMatch?.[1] ?? null,
+      });
+    }
+    return Array.from(byId.values());
+  } catch {
+    return [];
+  }
+}
+
+function currentSessionDir(): string | null {
+  try {
+    const file = latestCtx?.sessionManager?.getSessionFile();
+    return file ? dirname(file) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List every subagent that still has a pane open or a process alive,
+ * independent of state: live registry entries, orphaned pi processes, and
+ * orphaned named panes (where the backend supports pane naming). Lets the
+ * caller see the full picture before deciding to interrupt, steer, clean up,
+ * or close a pane manually.
+ */
+function handleSubagentsStatus(
+  deps: {
+    listAllSurfacesFn?: () => string[];
+    listNamedPanesFn?: () => Array<{ surface: string; label: string }>;
+    discoverOrphansFn?: (trackedIds: ReadonlySet<string>, sessionDir: string | null) => OrphanProcess[];
+  } = {},
+) {
+  const listAll = deps.listAllSurfacesFn ?? listAllSurfaces;
+  const listNamed = deps.listNamedPanesFn ?? listSubagentPanes;
+  const discover = deps.discoverOrphansFn ?? discoverOrphanSubagentProcesses;
+  const now = Date.now();
+  const trackedIds = new Set(runningSubagents.keys());
+  const allSurfaces = listAll();
+  const surfaceSet = new Set(allSurfaces);
+  const namedPanes = listNamed();
+  const orphanProcesses = discover(trackedIds, currentSessionDir());
+
+  const entries: Array<Record<string, unknown>> = [];
+  for (const running of runningSubagents.values()) {
+    const snapshot = classifyStatus(running.statusState, now);
+    entries.push({
+      id: running.id,
+      name: running.name,
+      surface: running.surface,
+      origin: "registry" as const,
+      paneOpen: surfaceSet.has(running.surface),
+      agent: running.agent ?? null,
+      task: running.task,
+      cli: running.cli ?? "pi",
+      interactive: running.interactive,
+      kind: snapshot.kind,
+      statusLabel: snapshot.statusLabel,
+      activityLabel: snapshot.activityLabel,
+      elapsedMs: snapshot.elapsedMs,
+    });
+  }
+
+  for (const orphan of orphanProcesses) {
+    entries.push({
+      id: orphan.id,
+      name: orphan.name,
+      surface: orphan.surface,
+      origin: "orphan-process" as const,
+      paneOpen: orphan.surface ? surfaceSet.has(orphan.surface) : false,
+      pid: orphan.pid,
+      agent: null,
+      task: null,
+      cli: "pi",
+      interactive: false,
+      kind: "orphan",
+      statusLabel: null,
+      activityLabel: null,
+      elapsedMs: null,
+    });
+  }
+
+  for (const pane of namedPanes) {
+    const tracked = Array.from(runningSubagents.values()).some((r) => r.surface === pane.surface);
+    if (tracked) continue;
+    entries.push({
+      id: null,
+      name: pane.label,
+      surface: pane.surface,
+      origin: "orphan-pane" as const,
+      paneOpen: true,
+      agent: null,
+      task: null,
+      cli: "unknown",
+      interactive: false,
+      kind: "orphan",
+      statusLabel: null,
+      activityLabel: null,
+      elapsedMs: null,
+    });
+  }
+
+  if (entries.length === 0) {
+    return {
+      content: [{ type: "text" as const, text: "No subagents or subagent panes found." }],
+      details: { count: 0, entries: [] },
+    };
+  }
+
+  const lines = entries.map((e: any) => {
+    if (e.origin === "orphan-process") {
+      const pane = e.surface ? `, pane ${e.surface}` : "";
+      return `• ${e.name} [orphan ${e.id}] — pi process alive (pid ${e.pid})${pane}, no running entry (restart the session to track it, or kill the process)`;
+    }
+    if (e.origin === "orphan-pane") {
+      return `• ${e.name} [orphan pane ${e.surface}] — pane open, no running entry (cannot interrupt/steer; close the pane or restart to reap)`;
+    }
+    const detail = [e.kind, e.activityLabel ?? e.statusLabel].filter(Boolean).join(" · ");
+    const elapsed = Math.floor((e.elapsedMs ?? 0) / 1000);
+    const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
+    const ss = String(elapsed % 60).padStart(2, "0");
+    const agentTag = e.agent ? ` (${e.agent})` : "";
+    const paneTag = e.paneOpen ? "" : " [pane closed]";
+    const task = e.task ? e.task.replace(/\s+/g, " ").trim().slice(0, 120) : "";
+    const taskLine = task ? `\n    task: ${task}${task.length === 120 ? "…" : ""}` : "";
+    return `• ${e.name} [${e.id}]${agentTag}${paneTag} — ${detail}, ${mm}:${ss}${taskLine}`;
+  });
+
+  const orphanCount = entries.filter((e: any) => (e.origin as string).startsWith("orphan")).length;
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `${entries.length} subagent${entries.length > 1 ? "s" : ""} (${entries.filter((e: any) => e.origin === "registry").length} tracked, ${orphanCount} orphan):\n${lines.join("\n")}`,
+      },
+    ],
+    details: { count: entries.length, entries },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1174,6 +1369,7 @@ export const __test__ = {
   handleSubagentInterrupt,
   handleSubagentSteer,
   handleSubagentCleanup,
+  handleSubagentsStatus,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   resolveParentModel,
@@ -2073,6 +2269,57 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               " " +
               theme.fg("toolTitle", theme.bold(String(details.count ?? ""))) +
               theme.fg("dim", " — cleaned"),
+            0,
+            0,
+          );
+        }
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagents_status tool ──
+  if (shouldRegister("subagents_status"))
+    pi.registerTool({
+      name: "subagents_status",
+      label: "Subagent Status",
+      description:
+        "List every subagent that still has a pane open or a process alive: tracked running entries (id, name, live " +
+        "status kind starting/active/waiting/stalled, elapsed, task), orphaned pi processes that lost their running " +
+        "entry (e.g. after an orchestrator restart), and orphaned named panes left behind by failed launches. " +
+        "\nUse it to see the full picture before targeting subagent_interrupt / subagent_steer / subagent_cleanup, or " +
+        "to spot panes that linger after a restart. Orphan entries cannot be interrupted or steered (no running " +
+        "entry); they can only be closed manually or reaped by restarting the session. " +
+        "NOT the same as subagents_list, which lists the available agent templates. " +
+        "Orphaned-pane discovery depends on backend naming support (herdr labels, zellij pane names); on other " +
+        "backends orphaned processes are still detected via the process table.",
+      promptSnippet:
+        "List all subagents still present: tracked entries plus orphaned processes/panes (id, name, status) — pick targets for interrupt/steer/cleanup; NOT the agent-template list (subagents_list).",
+      parameters: Type.Object({}),
+
+      async execute() {
+        return handleSubagentsStatus();
+      },
+
+      renderCall(_args, theme) {
+        return new Text(
+          theme.fg("accent", "▸") +
+            " " +
+            theme.fg("toolTitle", theme.bold("subagent status")) +
+            theme.fg("dim", " — query"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.count) {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(String(details.count))) +
+              theme.fg("dim", " — present"),
             0,
             0,
           );
