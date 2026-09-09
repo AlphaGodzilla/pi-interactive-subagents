@@ -156,6 +156,19 @@ const SubagentParams = Type.Object({
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
+/** How a subagent surface is opened in the multiplexer. */
+type SubagentMuxMode = "pane" | "tab";
+
+function parseMuxMode(value: string | undefined): SubagentMuxMode | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "pane" || normalized === "tab") return normalized;
+  return undefined;
+}
+
+function resolveMuxMode(agentDefs: AgentDefaults | null): SubagentMuxMode {
+  return agentDefs?.mux ?? "pane";
+}
+
 interface AgentDefaults {
   model?: string;
   tools?: string;
@@ -167,6 +180,8 @@ interface AgentDefaults {
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
+  /** How to open the subagent surface: split a pane (default) or create a tab. */
+  mux?: SubagentMuxMode;
   cwd?: string;
   cli?: string;
   body?: string;
@@ -274,6 +289,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
+    mux: parseMuxMode(getFrontmatterValue(frontmatter, "mux")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     cli: getFrontmatterValue(frontmatter, "cli"),
     body: body || undefined,
@@ -599,6 +615,8 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
+  /** How this subagent's surface was opened (pane split or tab). */
+  muxMode?: SubagentMuxMode;
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -1036,7 +1054,7 @@ function handleSubagentSteer(
  * - Without: clean every entry currently classified as `stalled`.
  */
 function handleSubagentCleanup(
-  params: { id?: string; name?: string },
+  params: { id?: string; name?: string; surface?: string },
   closeSurfaceFn: (surface: string) => void = closeSurface,
 ) {
   const now = Date.now();
@@ -1044,6 +1062,44 @@ function handleSubagentCleanup(
 
   const requestedId = params.id?.trim();
   const requestedName = params.name?.trim();
+  const requestedSurface = params.surface?.trim();
+
+  // Direct surface cleanup: removes an orphaned pane/tab that has no running
+  // entry (e.g. a dead tab left behind after a session restart). Closing the
+  // tab's root pane reaps the tab itself when it holds no other panes.
+  if (requestedSurface) {
+    const tracked = Array.from(runningSubagents.values()).find((r) => r.surface === requestedSurface);
+    try {
+      closeSurfaceFn(requestedSurface);
+    } catch (error: any) {
+      const message = `Failed to close surface "${requestedSurface}": ${error?.message ?? String(error)}`;
+      return {
+        content: [{ type: "text" as const, text: message }],
+        details: { error: message, surface: requestedSurface },
+      };
+    }
+    if (tracked) {
+      try {
+        tracked.abortController?.abort();
+      } catch {}
+      runningSubagents.delete(tracked.id);
+      updateWidget();
+    }
+    const trackedNote = tracked ? ` (running entry "${tracked.name}" [${tracked.id}] removed)` : "";
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Closed surface ${requestedSurface}${trackedNote}. The pane is gone; an empty tab is reaped automatically.`,
+        },
+      ],
+      details: {
+        cleaned: [{ id: tracked?.id ?? null, name: tracked?.name ?? null, surface: requestedSurface }],
+        count: 1,
+        status: "cleaned",
+      },
+    };
+  }
   if (requestedId || requestedName) {
     const resolved = resolveInterruptTarget({ id: requestedId || undefined, name: requestedName || undefined });
     if ("error" in resolved) {
@@ -1202,6 +1258,7 @@ function handleSubagentsStatus(
       name: running.name,
       surface: running.surface,
       origin: "registry" as const,
+      mux: running.muxMode ?? "pane",
       paneOpen: surfaceSet.has(running.surface),
       agent: running.agent ?? null,
       task: running.task,
@@ -1266,7 +1323,7 @@ function handleSubagentsStatus(
       return `• ${e.name} [orphan ${e.id}] — pi process alive (pid ${e.pid})${pane}, no running entry (restart the session to track it, or kill the process)`;
     }
     if (e.origin === "orphan-pane") {
-      return `• ${e.name} [orphan pane ${e.surface}] — pane open, no running entry (cannot interrupt/steer; close the pane or restart to reap)`;
+      return `• ${e.name} [orphan pane ${e.surface}] — pane open, no running entry (cannot interrupt/steer; clean up with subagent_cleanup({surface: "${e.surface}"}))`;
     }
     const detail = [e.kind, e.activityLabel ?? e.statusLabel].filter(Boolean).join(" · ");
     const elapsed = Math.floor((e.elapsedMs ?? 0) / 1000);
@@ -1274,9 +1331,10 @@ function handleSubagentsStatus(
     const ss = String(elapsed % 60).padStart(2, "0");
     const agentTag = e.agent ? ` (${e.agent})` : "";
     const paneTag = e.paneOpen ? "" : " [pane closed]";
+    const muxTag = e.mux === "tab" ? " [tab]" : "";
     const task = e.task ? e.task.replace(/\s+/g, " ").trim().slice(0, 120) : "";
     const taskLine = task ? `\n    task: ${task}${task.length === 120 ? "…" : ""}` : "";
-    return `• ${e.name} [${e.id}]${agentTag}${paneTag} — ${detail}, ${mm}:${ss}${taskLine}`;
+    return `• ${e.name} [${e.id}]${agentTag}${muxTag}${paneTag} — ${detail}, ${mm}:${ss}${taskLine}`;
   });
 
   const orphanCount = entries.filter((e: any) => (e.origin as string).startsWith("orphan")).length;
@@ -1359,6 +1417,8 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  parseMuxMode,
+  resolveMuxMode,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   formatWidgetRightLabel,
@@ -1433,7 +1493,7 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface = options?.surface ?? createSurface(params.name, { mode: resolveMuxMode(agentDefs) });
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1530,6 +1590,7 @@ async function launchSubagent(
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
+      muxMode: resolveMuxMode(agentDefs),
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
@@ -1691,6 +1752,7 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     steerFile,
+    muxMode: resolveMuxMode(agentDefs),
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -2237,12 +2299,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "- id or name (optional): force-clean that one subagent regardless of its status — its pane is closed and any " +
         "  pending result is abandoned. Targeting rules are the same as subagent_interrupt (8-hex id preferred, " +
         "  display name via the name field).\n" +
+        "- surface (optional): close a specific mux surface directly. Use this for orphaned panes/tabs that have no " +
+        "  running entry (e.g. dead tab-mode subagents reported by subagents_status as orphan panes); closing a tab's " +
+        "  root pane reaps the tab when it holds no other panes.\n" +
         "The cleaned subagent's watcher reports `cancelled` to you as the acknowledgement.",
       promptSnippet:
         "Clean up dead subagents: no args removes all `stalled` entries (closing their panes); pass id/name to force-remove one entry regardless of status.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Internal id (8-hex) of the subagent to force-clean; omit to clean all stalled entries" })),
         name: Type.Optional(Type.String({ description: "Display name of the subagent to force-clean (when the id is unknown)" })),
+        surface: Type.Optional(Type.String({ description: "Mux surface id (pane id) to close directly — use for orphaned panes/tabs with no running entry, e.g. the surface reported by subagents_status" })),
       }),
 
       async execute(_toolCallId, params) {

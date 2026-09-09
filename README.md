@@ -298,12 +298,19 @@ You are a specialized agent that does X...
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
+| `mux`         | string | How to open the subagent surface: `pane` (split a pane, default) or `tab` (new tab). Only herdr implements `tab` today; every other backend falls back to `pane`. |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+
+### `mux`
+
+Controls how the subagent surface opens: `pane` (default) splits a pane; `tab` creates a new tab. Only herdr implements `tab` today — every other backend silently falls back to `pane`.
+
+Closing follows herdr's own semantics: the tab creator is the subagent whose pane is the tab's root pane. When that subagent exits, its pane is closed and the tab is reaped automatically **only if no other pane remains in it** — panes split inside the tab (user splits or nested subagents) keep the tab alive, and their own exits never close the tab. `subagent_cleanup` reaps dead tab-mode subagents the same way (closing the root pane, which reaps an otherwise-empty tab).
 
 ---
 

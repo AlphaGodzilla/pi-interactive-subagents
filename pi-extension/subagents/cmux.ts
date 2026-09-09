@@ -764,8 +764,51 @@ function createCmuxSplitSurface(
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
-export function createSurface(name: string): string {
+export interface CreateSurfaceOptions {
+  /** "tab" opens the subagent in a new tab where the backend supports it; other backends fall back to a pane split. */
+  mode?: "pane" | "tab";
+}
+
+/** Args for `herdr tab create` used by the tab mux mode (pure, unit-testable). */
+export function buildHerdrTabCreateArgs(name: string, cwd: string): string[] {
+  return ["tab", "create", "--label", name, "--cwd", cwd, "--no-focus"];
+}
+
+/** Extract the tab's root pane id from `herdr tab create` output (pure, unit-testable). */
+export function parseHerdrTabCreateOutput(output: string): string {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error(`Unexpected herdr tab create output: ${output || "(empty)"}`);
+  }
+  const paneId = parsed?.result?.root_pane?.pane_id;
+  if (typeof paneId !== "string" || !paneId) {
+    throw new Error(`Unexpected herdr tab create output: ${output}`);
+  }
+  return paneId;
+}
+
+function createHerdrTabSurface(name: string): string {
+  const output = execFileSync("herdr", buildHerdrTabCreateArgs(name, process.cwd()), {
+    encoding: "utf8",
+  }).trim();
+  const paneId = parseHerdrTabCreateOutput(output);
+  // Label the root pane too so orphan-pane discovery (listSubagentPanes) sees it.
+  try {
+    execFileSync("herdr", ["pane", "rename", paneId, name], { encoding: "utf8" });
+  } catch {
+    // Optional.
+  }
+  return paneId;
+}
+
+export function createSurface(name: string, options?: CreateSurfaceOptions): string {
   const backend = getMuxBackend();
+
+  if (options?.mode === "tab" && backend === "herdr") {
+    return createHerdrTabSurface(name);
+  }
 
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it

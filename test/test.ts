@@ -27,6 +27,8 @@ import {
   parseCmuxJson,
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
+  buildHerdrTabCreateArgs,
+  parseHerdrTabCreateOutput,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -118,6 +120,9 @@ function createMockExtensionApi() {
         sentMessages.push({ message, options });
       },
       getAllTools() {
+        return [];
+      },
+      getActiveTools() {
         return [];
       },
     } as any,
@@ -893,6 +898,63 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads mux mode from frontmatter and defaults to pane", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "mux-tab-test-agent",
+        ["name: mux-tab-test-agent", "model: anthropic/test-mux-tab", "mux: tab"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "mux-pane-test-agent",
+        ["name: mux-pane-test-agent", "model: anthropic/test-mux-pane", "mux: pane"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "mux-unset-test-agent",
+        ["name: mux-unset-test-agent", "model: anthropic/test-mux-unset"].join("\n"),
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "mux-invalid-test-agent",
+        ["name: mux-invalid-test-agent", "model: anthropic/test-mux-invalid", "mux: split"].join("\n"),
+      );
+
+      assert.equal(testApi.loadAgentDefaults("mux-tab-test-agent")?.mux, "tab");
+      assert.equal(testApi.loadAgentDefaults("mux-pane-test-agent")?.mux, "pane");
+      assert.equal(testApi.loadAgentDefaults("mux-unset-test-agent")?.mux, undefined);
+      assert.equal(testApi.loadAgentDefaults("mux-invalid-test-agent")?.mux, undefined);
+    });
+  });
+
+  it("resolves the effective mux mode with pane as the default", () => {
+    assert.equal(testApi.resolveMuxMode(null), "pane");
+    assert.equal(testApi.resolveMuxMode({}), "pane");
+    assert.equal(testApi.resolveMuxMode({ mux: "pane" }), "pane");
+    assert.equal(testApi.resolveMuxMode({ mux: "tab" }), "tab");
+    assert.equal(testApi.parseMuxMode("TAB"), "tab");
+    assert.equal(testApi.parseMuxMode(" pane "), "pane");
+    assert.equal(testApi.parseMuxMode("window"), undefined);
+  });
+
+  it("builds herdr tab-create args and parses its output", () => {
+    assert.deepEqual(buildHerdrTabCreateArgs("Scout", "/tmp/work"), [
+      "tab", "create", "--label", "Scout", "--cwd", "/tmp/work", "--no-focus",
+    ]);
+
+    const output = JSON.stringify({
+      id: "cli:tab:create",
+      result: {
+        root_pane: { pane_id: "w1:p3T" },
+        tab: { tab_id: "w1:tJ", label: "Scout" },
+      },
+    });
+    assert.equal(parseHerdrTabCreateOutput(output), "w1:p3T");
+    assert.throws(() => parseHerdrTabCreateOutput("not json"), /Unexpected herdr tab create output/);
+    assert.throws(() => parseHerdrTabCreateOutput("{}"), /Unexpected herdr tab create output/);
+  });
+
   it("loads explicit interactive flag from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1325,6 +1387,7 @@ describe("subagent-done.ts", () => {
       const pi = {
         on: (name: string, fn: (event?: any, ctx?: any) => void) => handlers.set(name, fn),
         getAllTools: () => [],
+        getActiveTools: () => [],
         registerShortcut: () => {},
         registerTool: () => {},
         sendUserMessage: async () => {},
@@ -2125,15 +2188,23 @@ describe("subagent interruption", () => {
         statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
       }));
 
+      runningMap.set("t1", makeRunning({
+        id: "t1",
+        name: "TabWorker",
+        surface: "pane-t1",
+        muxMode: "tab",
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      }));
+
       const result = withMockedNow(200_000, () =>
         testApi.handleSubagentsStatus({
-          listAllSurfacesFn: () => ["pane-a1", "pane-z9"],
+          listAllSurfacesFn: () => ["pane-a1", "pane-z9", "pane-t1"],
           listNamedPanesFn: () => [],
           discoverOrphansFn: () => [],
         }),
       );
 
-      assert.equal(result.details.count, 2);
+      assert.equal(result.details.count, 3);
       assert.equal(result.details.entries[0].id, "a1");
       assert.equal(result.details.entries[0].kind, "active");
       assert.equal(result.details.entries[0].activityLabel, "bash");
@@ -2143,7 +2214,9 @@ describe("subagent interruption", () => {
       assert.equal(result.details.entries[1].paneOpen, true);
       assert.match(result.content[0].text, /Worker \[a1\]/);
       assert.match(result.content[0].text, /Zombie \[z9\]/);
-      assert.match(result.content[0].text, /2 subagents \(2 tracked, 0 orphan\)/);
+      assert.match(result.content[0].text, /3 subagents \(3 tracked, 0 orphan\)/);
+      assert.match(result.content[0].text, /TabWorker \[t1\] \[tab\]/);
+      assert.equal(result.details.entries[2].mux, "tab");
       assert.match(result.content[0].text, /fix the API tests/);
     } finally {
       runningMap.clear();
@@ -2195,6 +2268,56 @@ describe("subagent interruption", () => {
       assert.equal(result.details.entries.length, 3);
       const orphanKinds = result.details.entries.map((e: any) => e.origin).sort();
       assert.deepEqual(orphanKinds, ["orphan-pane", "orphan-process", "registry"]);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("closes a specified surface directly, removing any matching running entry", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closedSurfaces: string[] = [];
+    const aborted: string[] = [];
+    runningMap.clear();
+
+    try {
+      runningMap.set("t1", makeRunning({
+        id: "t1",
+        name: "TabWorker",
+        surface: "pane-t1",
+        muxMode: "tab",
+        statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+        abortController: { abort: () => aborted.push("t1") },
+      }));
+
+      const tracked = testApi.handleSubagentCleanup(
+        { surface: "pane-t1" },
+        (surface: string) => closedSurfaces.push(surface),
+      );
+      assert.deepEqual(closedSurfaces, ["pane-t1"]);
+      assert.deepEqual(aborted, ["t1"]);
+      assert.equal(runningMap.has("t1"), false);
+      assert.match(tracked.content[0].text, /Closed surface pane-t1/);
+      assert.match(tracked.content[0].text, /TabWorker/);
+
+      // Orphan surface with no running entry: still closes, no crash.
+      const orphan = testApi.handleSubagentCleanup(
+        { surface: "pane-orphan" },
+        (surface: string) => closedSurfaces.push(surface),
+      );
+      assert.deepEqual(closedSurfaces, ["pane-t1", "pane-orphan"]);
+      assert.match(orphan.content[0].text, /Closed surface pane-orphan/);
+      assert.doesNotMatch(orphan.content[0].text, /running entry/);
+
+      // Close failure is reported, not thrown.
+      const failed = testApi.handleSubagentCleanup(
+        { surface: "pane-gone" },
+        () => {
+          throw new Error("pane not found");
+        },
+      );
+      assert.match(failed.content[0].text, /Failed to close surface "pane-gone"/);
+      assert.match(failed.content[0].text, /pane not found/);
     } finally {
       runningMap.clear();
     }

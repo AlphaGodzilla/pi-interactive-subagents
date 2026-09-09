@@ -214,8 +214,9 @@ export default function (pi: ExtensionAPI) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
-    const tools = pi.getAllTools();
-    toolNames = tools.map((t) => t.name).sort();
+    // Active tools only — getAllTools() would list never-activated
+    // cross-platform built-ins (e.g. powershell on macOS) as available.
+    toolNames = pi.getActiveTools().sort();
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
