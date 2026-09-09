@@ -73,6 +73,8 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). 
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagent_steer`     | Send a steering message into a running Pi-backed subagent's session                         |
 | `subagents_list`     | List available agent definitions                                                            |
+| `subagents_status`   | List subagents still present: tracked entries plus orphaned processes/panes (async-free query) |
+| `subagent_cleanup`   | Clean up dead/orphaned subagents: stalled entries, a specific id/name, or a specific `surface` |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
 | Command                    | Description                          |
@@ -311,6 +313,24 @@ You are a specialized agent that does X...
 Controls how the subagent surface opens: `pane` (default) splits a pane; `tab` creates a new tab. Only herdr implements `tab` today — every other backend silently falls back to `pane`.
 
 Closing follows herdr's own semantics: the tab creator is the subagent whose pane is the tab's root pane. When that subagent exits, its pane is closed and the tab is reaped automatically **only if no other pane remains in it** — panes split inside the tab (user splits or nested subagents) keep the tab alive, and their own exits never close the tab. `subagent_cleanup` reaps dead tab-mode subagents the same way (closing the root pane, which reaps an otherwise-empty tab).
+
+---
+
+## Inspecting and cleaning up subagents
+
+`subagents_status` lists every subagent that still has a pane open or a process alive:
+
+- **tracked** entries from the running registry, with live status, elapsed time, and a `[tab]` marker for tab-mode subagents
+- **orphan processes**: pi subagents still running whose running entry was lost (e.g. after a session restart), discovered from the process table and filtered to this session's directory
+- **orphan panes**: named panes left behind by failed launches that no running entry tracks
+
+`subagent_cleanup` removes them:
+
+| Call | Effect |
+| --- | --- |
+| `subagent_cleanup()` | Clean every entry currently classified as `stalled` (active/waiting subagents are untouched) |
+| `subagent_cleanup({ id })` / `subagent_cleanup({ name })` | Force-clean that one subagent regardless of status (pane closed, pending result abandoned) |
+| `subagent_cleanup({ surface })` | Close a specific mux surface directly — use for orphan panes/tabs reported by `subagents_status`; closing a tab's root pane reaps the tab when it holds no other panes |
 
 ---
 
