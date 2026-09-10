@@ -29,6 +29,7 @@ import {
   parseCmuxPaneRefForSurfaceFromJson,
   buildHerdrTabCreateArgs,
   parseHerdrTabCreateOutput,
+  resolveSurfaceRequest,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -936,6 +937,48 @@ describe("subagent discovery", () => {
     assert.equal(testApi.parseMuxMode("TAB"), "tab");
     assert.equal(testApi.parseMuxMode(" pane "), "pane");
     assert.equal(testApi.parseMuxMode("window"), undefined);
+  });
+
+  it("honors tab requests and pins pane splits to the spawning parent's pane", () => {
+    // A child that explicitly declares mux: tab still gets its own tab, even
+    // when spawned from another tab-mode subagent.
+    assert.deepEqual(
+      resolveSurfaceRequest("tab", "herdr", {
+        subagentSurface: "w1:p41",
+        herdrPaneId: "w1:p41",
+      }),
+      { mode: "tab", parentSurface: "w1:p41" },
+    );
+
+    // Pane mode: the split targets the spawning parent's own pane, so a
+    // subagent of a tab-mode subagent lands inside that same tab.
+    assert.deepEqual(
+      resolveSurfaceRequest("pane", "herdr", {
+        subagentSurface: "w1:p41",
+        herdrPaneId: "w1:p41",
+      }),
+      { mode: "pane", parentSurface: "w1:p41" },
+    );
+
+    // Parent surface (PI_SUBAGENT_SURFACE) wins over the mux pane env.
+    assert.deepEqual(
+      resolveSurfaceRequest("pane", "herdr", {
+        subagentSurface: "w1:p9",
+        herdrPaneId: "w1:p1",
+      }),
+      { mode: "pane", parentSurface: "w1:p9" },
+    );
+
+    // Non-herdr backends fall back to a pane split.
+    assert.deepEqual(
+      resolveSurfaceRequest("tab", "tmux", { tmuxPane: "%3" }),
+      { mode: "pane", parentSurface: "%3" },
+    );
+
+    assert.deepEqual(
+      resolveSurfaceRequest("pane", null, {}),
+      { mode: "pane", parentSurface: undefined },
+    );
   });
 
   it("builds herdr tab-create args and parses its output", () => {

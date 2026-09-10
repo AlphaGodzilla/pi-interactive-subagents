@@ -769,6 +769,38 @@ export interface CreateSurfaceOptions {
   mode?: "pane" | "tab";
 }
 
+/**
+ * Decide where a spawning pi's surface goes (pure, unit-testable).
+ *
+ * Rules:
+ * - "tab" is honored on herdr (a child agent that explicitly declares
+ *   `mux: tab` gets its own tab, even when spawned from another tab-mode
+ *   subagent); every other backend falls back to a pane split.
+ * - Pane splits always target the spawning parent's own pane
+ *   (PI_SUBAGENT_SURFACE, then the backend's pane env var) instead of the
+ *   focused pane — so a subagent spawned from a tab-mode subagent lands inside
+ *   that tab, and splits follow the agent, not the user's focus.
+ */
+export function resolveSurfaceRequest(
+  requested: "pane" | "tab",
+  backend: string | null,
+  env: {
+    subagentSurface?: string;
+    herdrPaneId?: string;
+    tmuxPane?: string;
+  },
+): { mode: "pane" | "tab"; parentSurface?: string } {
+  const parentSurface =
+    backend === "herdr"
+      ? env.subagentSurface ?? env.herdrPaneId
+      : backend === "tmux"
+        ? env.tmuxPane
+        : undefined;
+
+  const mode = requested === "tab" && backend === "herdr" ? "tab" : "pane";
+  return { mode, parentSurface };
+}
+
 /** Args for `herdr tab create` used by the tab mux mode (pure, unit-testable). */
 export function buildHerdrTabCreateArgs(name: string, cwd: string): string[] {
   return ["tab", "create", "--label", name, "--cwd", cwd, "--no-focus"];
@@ -805,8 +837,13 @@ function createHerdrTabSurface(name: string): string {
 
 export function createSurface(name: string, options?: CreateSurfaceOptions): string {
   const backend = getMuxBackend();
+  const request = resolveSurfaceRequest(options?.mode ?? "pane", backend, {
+    subagentSurface: process.env.PI_SUBAGENT_SURFACE,
+    herdrPaneId: process.env.HERDR_PANE_ID,
+    tmuxPane: process.env.TMUX_PANE,
+  });
 
-  if (options?.mode === "tab" && backend === "herdr") {
+  if (request.mode === "tab") {
     return createHerdrTabSurface(name);
   }
 
@@ -832,14 +869,11 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
     return createZellijSurface(name);
   }
 
-  // On tmux/herdr, target the parent pi's pane so splits follow the agent, not the user's focus.
+  // On tmux/herdr, target the spawning parent's pane so splits follow the agent,
+  // not the user's focus. Style note: the parent pane comes from
+  // PI_SUBAGENT_SURFACE (set for every subagent) before the mux's own env var.
   // See https://github.com/HazAT/pi-interactive-subagents/issues/12
-  const fromSurface = backend === "tmux"
-    ? process.env.TMUX_PANE
-    : backend === "herdr"
-      ? process.env.HERDR_PANE_ID
-      : undefined;
-  return createSurfaceSplit(name, "right", fromSurface);
+  return createSurfaceSplit(name, "right", request.parentSurface);
 }
 
 /**
