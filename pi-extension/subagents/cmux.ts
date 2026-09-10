@@ -772,7 +772,13 @@ export interface CreateSurfaceOptions {
    * mode splits inside that workspace's root pane; tab mode creates the tab
    * in that workspace.
    */
-  worktree?: { workspaceId: string; rootPane: string };
+  worktree?: {
+    workspaceId: string;
+    rootPane: string;
+    rootTabId?: string;
+    /** True when this spawn created/opened the workspace (root tab is empty and reusable). */
+    fresh?: boolean;
+  };
 }
 
 /**
@@ -818,6 +824,8 @@ export interface HerdrWorktreeEntry {
 export interface HerdrWorktreeContext {
   workspaceId: string;
   rootPane: string;
+  /** Root tab of the worktree workspace (the initial "1" tab herdr creates). */
+  rootTabId?: string;
   path: string;
   /**
    * True when this spawn opened/created the workspace (safe to close it once
@@ -862,6 +870,7 @@ export function parseWorktreeCommandOutput(output: string): HerdrWorktreeContext
   }
   const workspaceId = parsed?.result?.workspace?.workspace_id;
   const rootPane = parsed?.result?.root_pane?.pane_id;
+  const rootTabId = parsed?.result?.tab?.tab_id;
   const path = parsed?.result?.worktree?.path;
   if (typeof workspaceId !== "string" || typeof rootPane !== "string" || typeof path !== "string") {
     throw new Error(`Unexpected herdr worktree output: ${output}`);
@@ -869,7 +878,13 @@ export function parseWorktreeCommandOutput(output: string): HerdrWorktreeContext
   // `already_open: true` (worktree open) means the workspace predates this
   // call; create never sets it, so freshly created workspaces are ours.
   const openedByUs = parsed?.result?.already_open !== true;
-  return { workspaceId, rootPane, path, openedByUs };
+  return {
+    workspaceId,
+    rootPane,
+    ...(typeof rootTabId === "string" ? { rootTabId } : {}),
+    path,
+    openedByUs,
+  };
 }
 
 /**
@@ -990,13 +1005,35 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
     tmuxPane: process.env.TMUX_PANE,
   });
 
-  // Worktree placements (herdr git-worktree workspaces): pane mode splits
-  // inside the worktree workspace's root pane, tab mode opens a tab there.
+  // Worktree placements (herdr git-worktree workspaces):
+  // - A FRESHLY created/opened workspace is dedicated to this spawn: run the
+  //   subagent in its root pane. The workspace keeps exactly one tab (the
+  //   root tab) with exactly one pane — no split, no extra tab. Pane and tab
+  //   get renamed to the subagent for identification.
+  // - A PRE-EXISTING workspace the user is already in: stay out of their
+  //   root tab — tab mode opens a new tab, pane mode splits beside the root
+  //   pane.
   if (options?.worktree && backend === "herdr") {
-    if (request.mode === "tab") {
-      return createHerdrTabSurface(name, options.worktree.workspaceId);
+    const wt = options.worktree;
+    if (wt.fresh) {
+      try {
+        execFileSync("herdr", ["pane", "rename", wt.rootPane, name], { encoding: "utf8" });
+      } catch {
+        // Cosmetic.
+      }
+      if (wt.rootTabId) {
+        try {
+          execFileSync("herdr", ["tab", "rename", wt.rootTabId, name], { encoding: "utf8" });
+        } catch {
+          // Cosmetic.
+        }
+      }
+      return wt.rootPane;
     }
-    return createSurfaceSplit(name, "right", options.worktree.rootPane);
+    if (request.mode === "tab") {
+      return createHerdrTabSurface(name, wt.workspaceId);
+    }
+    return createSurfaceSplit(name, "right", wt.rootPane);
   }
 
   if (request.mode === "tab") {
@@ -1668,7 +1705,7 @@ export function listSubagentPanes(): Array<{ surface: string; label: string }> {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "surface-gone";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
@@ -1718,6 +1755,10 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  // Consecutive read failures. A destroyed pane (closed by the user, or its
+  // workspace reaped) makes every read fail; after a few ticks we treat the
+  // surface as gone instead of polling a dead pane forever.
+  let screenFailures = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -1748,6 +1789,7 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      screenFailures = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -1763,6 +1805,10 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      screenFailures += 1;
+      if (screenFailures >= 3) {
+        return { reason: "surface-gone", exitCode: 1 };
       }
     }
 

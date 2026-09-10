@@ -315,7 +315,7 @@ Controls how the subagent surface opens: `pane` (default) splits a pane; `tab` c
 
 The tab is created in the **spawning agent's workspace** (herdr `tab create --workspace`), not the workspace the user currently has focused.
 
-With the `worktree` spawn parameter, the surface is instead placed inside the worktree's own herdr workspace: pane mode splits inside that workspace's root pane, tab mode opens the tab there. `herdr worktree list/open/create` are used to reuse an existing worktree or create a missing one (`<repo-dir>-<name>` sibling checkout, branch `name`).
+With the `worktree` spawn parameter, the surface is instead placed inside the worktree's own herdr workspace. A **freshly created** (or freshly opened) worktree workspace is dedicated to the spawn: the subagent runs **directly in its root pane** — the workspace keeps exactly one tab and one pane, both renamed to the subagent (no split, no extra tab). A pre-existing worktree workspace (already open, possibly in use) is not disturbed: pane mode splits beside the root pane, tab mode opens a new tab there. `herdr worktree list/open/create` are used to reuse an existing worktree or create a missing one (`<repo-dir>-<name>` sibling checkout, branch `name`).
 
 The worktree workspace is **closed automatically once its last subagent finishes** (closing the root pane lets herdr recycle the workspace; the git checkout stays on disk for reuse). This applies only when the spawn opened/created the workspace — a worktree workspace the user already had open is left untouched. Nested subagents spawned inside that workspace count as part of it, so the workspace stays open until all of them are done.
 

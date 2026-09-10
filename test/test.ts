@@ -1011,6 +1011,7 @@ describe("subagent discovery", () => {
       id: "cli:worktree:create",
       result: {
         workspace: { workspace_id: "w7", label: "probe-wt-1" },
+        tab: { tab_id: "w7:t1" },
         root_pane: { pane_id: "w7:p1" },
         worktree: { path: "/repo/proj-probe-wt-1", branch: "probe-wt-1" },
       },
@@ -1018,6 +1019,7 @@ describe("subagent discovery", () => {
     assert.deepEqual(parseWorktreeCommandOutput(output), {
       workspaceId: "w7",
       rootPane: "w7:p1",
+      rootTabId: "w7:t1",
       path: "/repo/proj-probe-wt-1",
       openedByUs: true,
     });

@@ -1575,7 +1575,12 @@ async function launchSubagent(
   const surface = options?.surface ?? createSurface(params.name, {
     mode: resolveMuxMode(agentDefs),
     worktree: options?.worktree
-      ? { workspaceId: options.worktree.workspaceId, rootPane: options.worktree.rootPane }
+      ? {
+          workspaceId: options.worktree.workspaceId,
+          rootPane: options.worktree.rootPane,
+          rootTabId: options.worktree.rootTabId,
+          fresh: options.worktree.openedByUs,
+        }
       : undefined,
   });
   if (!surfacePreCreated) {
@@ -1929,7 +1934,11 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      try {
+        closeSurface(surface);
+      } catch {
+        // The pane may already be gone (user closed it, workspace reaped).
+      }
       runningSubagents.delete(running.id);
       maybeReapWorktreeWorkspace(running.worktree);
 
@@ -1960,13 +1969,28 @@ async function watchSubagent(
     // Surface the pane's last output so the orchestrator sees the real cause
     // instead of a bare exit code or "Aborted while waiting" noise.
     if (result.exitCode !== 0 || result.errorMessage) {
-      const paneTail = readPaneTail(surface);
-      if (paneTail) {
-        summary = `${summary}\n\n--- last subagent pane output ---\n${paneTail}`;
+      try {
+        const paneTail = readPaneTail(surface);
+        if (paneTail) {
+          summary = `${summary}\n\n--- last subagent pane output ---\n${paneTail}`;
+        }
+      } catch {
+        // Pane already gone — nothing to capture.
       }
     }
 
-    closeSurface(surface);
+    // The pane was closed externally (user closed it, or its workspace was
+    // reaped); the child never signalled completion.
+    const surfaceGone = result.reason === "surface-gone";
+    if (surfaceGone && result.exitCode !== 0 && !result.errorMessage) {
+      summary = `${summary}\n\n(Pane was closed externally before the sub-agent finished.)`;
+    }
+
+    try {
+      closeSurface(surface);
+    } catch {
+      // Already gone — fine.
+    }
     runningSubagents.delete(running.id);
     maybeReapWorktreeWorkspace(running.worktree);
 
