@@ -4,8 +4,17 @@ import {
   execFileSync as rawExecFileSync,
   spawnSync,
 } from "node:child_process";
-import { promisify } from "node:util";
-import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -33,19 +42,36 @@ const execSync = ((command: string, options?: unknown) =>
 const execFileSync = ((file: string, args: readonly string[], options?: unknown) =>
   rawExecFileSync(file, args as string[], withCliStdio(options as Record<string, unknown>))) as typeof rawExecFileSync;
 
-const execFile = ((file: string, args: readonly string[], options: unknown, callback: (...cbArgs: unknown[]) => void) =>
-  rawExecFile(
-    file,
-    args as string[],
-    withCliStdio(options as Record<string, unknown>),
-    callback as (...cbArgs: unknown[]) => void,
-  )) as typeof rawExecFile;
-
-const execFileAsync = promisify(execFile) as (
+/**
+ * Promise wrapper around the raw execFile. Deliberately NOT
+ * `promisify(execFile)`: promisify only preserves execFile's custom
+ * `{ stdout, stderr }` resolution when it finds the original function's
+ * `util.promisify.custom` symbol, which any wrapper function does not carry —
+ * promisify would resolve the bare stdout string instead, silently turning
+ * every `const { stdout } = await execFileAsync(...)` into `undefined`.
+ */
+const execFileAsync = (
   file: string,
   args?: readonly string[],
   options?: Record<string, unknown>,
-) => Promise<{ stdout: string; stderr: string }>;
+): Promise<{ stdout: string; stderr: string }> =>
+  new Promise((resolve, reject) => {
+    rawExecFile(
+      file,
+      (args ?? []) as string[],
+      withCliStdio(options),
+      (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => {
+        const out = { stdout: String(stdout ?? ""), stderr: String(stderr ?? "") };
+        if (error) {
+          // Keep exec-style error shape so callers can inspect err.stdout/err.stderr.
+          Object.assign(error, out);
+          reject(error);
+        } else {
+          resolve(out);
+        }
+      },
+    );
+  });
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
@@ -1906,6 +1932,21 @@ function interpretExitSidecar(data: any): PollResult {
 
 export const __pollForExitTest__ = { interpretExitSidecar };
 
+// ── Poll diagnostics (temporary) ────────────────────────────────────────
+// When /tmp/pi-subagent-poll-debug.on exists, every polling decision is
+// appended to /tmp/pi-subagent-poll-debug.log. Used to diagnose why the
+// screen-sentinel fallback can miss a finished subagent.
+const POLL_DEBUG_TOGGLE = "/tmp/pi-subagent-poll-debug.on";
+const POLL_DEBUG_LOG = "/tmp/pi-subagent-poll-debug.log";
+function pollDebug(surface: string, message: string): void {
+  try {
+    if (!existsSync(POLL_DEBUG_TOGGLE)) return;
+    appendFileSync(POLL_DEBUG_LOG, `${new Date().toISOString()} [${surface}] ${message}\n`);
+  } catch {
+    // Diagnostics must never break polling.
+  }
+}
+
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
  * (written by subagent_done / caller_ping), falling back to the terminal
@@ -1927,8 +1968,11 @@ export async function pollForExit(
   // surface as gone instead of polling a dead pane forever.
   let screenFailures = 0;
 
+  pollDebug(surface, `start interval=${options.interval}sessionFile=${options.sessionFile ?? "-"}`);
+
   for (;;) {
     if (signal.aborted) {
+      pollDebug(surface, "ABORTED (signal)");
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
@@ -1939,6 +1983,7 @@ export async function pollForExit(
         if (existsSync(exitFile)) {
           const data = JSON.parse(readFileSync(exitFile, "utf8"));
           rmSync(exitFile, { force: true });
+          pollDebug(surface, `exit sidecar hit: ${JSON.stringify(data)}`);
           return interpretExitSidecar(data);
         }
       } catch {}
@@ -1957,18 +2002,22 @@ export async function pollForExit(
     try {
       const screen = await readScreenAsync(surface, 5);
       screenFailures = 0;
+      pollDebug(surface, `screen ok len=${screen.length} tail=${JSON.stringify(screen.slice(-110))}`);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
+        pollDebug(surface, `SENTINEL ${match[0]}`);
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
-    } catch {
+    } catch (err) {
       // Surface may have been destroyed — check if .exit file appeared in the meantime
+      pollDebug(surface, `screen FAIL: ${String((err as any)?.message ?? err).slice(0, 140)}`);
       if (options.sessionFile) {
         try {
           const exitFile = `${options.sessionFile}.exit`;
           if (existsSync(exitFile)) {
             const data = JSON.parse(readFileSync(exitFile, "utf8"));
             rmSync(exitFile, { force: true });
+            pollDebug(surface, `exit sidecar hit (in catch): ${JSON.stringify(data)}`);
             return interpretExitSidecar(data);
           }
         } catch {}
@@ -1986,7 +2035,9 @@ export async function pollForExit(
         } catch {
           knownSurfaces = [];
         }
+        pollDebug(surface, `surface check known=${knownSurfaces.length} contains=${knownSurfaces.includes(surface)}`);
         if (knownSurfaces.length > 0 && !knownSurfaces.includes(surface)) {
+          pollDebug(surface, "return surface-gone");
           return { reason: "surface-gone", exitCode: 1 };
         }
         screenFailures = 0;
