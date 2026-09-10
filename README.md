@@ -344,6 +344,17 @@ Closing follows herdr's own semantics: the tab creator is the subagent whose pan
 | `subagent_cleanup({ id })` / `subagent_cleanup({ name })` | Force-clean that one subagent regardless of status (pane closed, pending result abandoned) |
 | `subagent_cleanup({ surface })` | Close a specific mux surface directly — use for orphan panes/tabs reported by `subagents_status`; closing a tab's root pane reaps the tab when it holds no other panes |
 
+### Poll diagnostics (debugging)
+
+When a subagent's pane is not being reaped as expected, enable the built-in polling diagnostics:
+
+```bash
+touch /tmp/pi-subagent-poll-debug.on     # enable (disabled by default)
+rm -f /tmp/pi-subagent-poll-debug.log    # optional: start with a clean log
+```
+
+While enabled, every polling decision of the exit watcher is appended to `/tmp/pi-subagent-poll-debug.log`: each screen read (content tail on success, error message on failure), `.exit` sidecar hits, surface existence checks, and sentinel matches. Disable again with `rm /tmp/pi-subagent-poll-debug.on`.
+
 ---
 
 Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
