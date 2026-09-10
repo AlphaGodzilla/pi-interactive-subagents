@@ -1,10 +1,48 @@
-import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
+import {
+  execSync as rawExecSync,
+  execFile as rawExecFile,
+  execFileSync as rawExecFileSync,
+  spawnSync,
+} from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-const execFileAsync = promisify(execFile);
+// ── CLI invocation wrappers ─────────────────────────────────────────────
+// Mux CLIs (herdr/tmux/wezterm/cmux/zellij) print machine-readable error
+// payloads to stderr — e.g. `{"error":{"code":"pane_not_found",...}}` when
+// closing a pane that herdr already reaped. Node's exec* helpers inherit
+// stderr by default, so those payloads leak straight into the pi TUI and
+// show up as stray text in the editor area (the "placeholder JSON" that
+// appeared after a worktree workspace was closed). Capture stderr instead:
+// failures still throw (with stderr on the error), but nothing is printed.
+// Calls that pass their own `stdio` (e.g. `{ stdio: "ignore" }`) keep it.
+const CLI_STDIO: ["ignore", "pipe", "pipe"] = ["ignore", "pipe", "pipe"];
+
+function withCliStdio(options?: Record<string, unknown>): Record<string, unknown> {
+  return { stdio: CLI_STDIO, ...options };
+}
+
+const execSync = ((command: string, options?: unknown) =>
+  rawExecSync(command, withCliStdio(options as Record<string, unknown>))) as typeof rawExecSync;
+
+const execFileSync = ((file: string, args: readonly string[], options?: unknown) =>
+  rawExecFileSync(file, args as string[], withCliStdio(options as Record<string, unknown>))) as typeof rawExecFileSync;
+
+const execFile = ((file: string, args: readonly string[], options: unknown, callback: (...cbArgs: unknown[]) => void) =>
+  rawExecFile(
+    file,
+    args as string[],
+    withCliStdio(options as Record<string, unknown>),
+    callback as (...cbArgs: unknown[]) => void,
+  )) as typeof rawExecFile;
+
+const execFileAsync = promisify(execFile) as (
+  file: string,
+  args?: readonly string[],
+  options?: Record<string, unknown>,
+) => Promise<{ stdout: string; stderr: string }>;
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
@@ -1808,7 +1846,21 @@ export async function pollForExit(
       }
       screenFailures += 1;
       if (screenFailures >= 3) {
-        return { reason: "surface-gone", exitCode: 1 };
+        // Read failures alone don't prove the pane is gone — herdr pane reads
+        // can fail for a LIVE pane (a full-screen TUI occupying it, or a pane
+        // that has just spawned). Only the mux's own pane list is ground
+        // truth: report surface-gone just when a non-empty listing no longer
+        // contains the surface. Otherwise keep polling (reset the counter).
+        let knownSurfaces: string[] = [];
+        try {
+          knownSurfaces = listAllSurfaces();
+        } catch {
+          knownSurfaces = [];
+        }
+        if (knownSurfaces.length > 0 && !knownSurfaces.includes(surface)) {
+          return { reason: "surface-gone", exitCode: 1 };
+        }
+        screenFailures = 0;
       }
     }
 

@@ -1235,6 +1235,8 @@ function discoverOrphanSubagentProcesses(
     const out = execSync("ps eww -axo pid=,command=", {
       encoding: "utf8",
       maxBuffer: 8 * 1024 * 1024,
+      // Capture stderr: inherited stderr would leak into the agent TUI.
+      stdio: ["ignore", "pipe", "pipe"],
     });
     const byId = new Map<string, OrphanProcess>();
     for (const line of out.split("\n")) {
