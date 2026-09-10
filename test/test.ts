@@ -1691,6 +1691,13 @@ describe("cmux.ts interpretExitSidecar", () => {
     });
   });
 
+  it("treats a shutdown payload (pi quit without subagent_done) as a normal end", () => {
+    assert.deepEqual(interpretExitSidecar({ type: "shutdown" }), {
+      reason: "done",
+      exitCode: 0,
+    });
+  });
+
   it("decodes error payloads and propagates the message with a non-zero exit code", () => {
     assert.deepEqual(
       interpretExitSidecar({

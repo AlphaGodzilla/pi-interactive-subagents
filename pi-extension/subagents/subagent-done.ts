@@ -8,7 +8,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { createSteerPoller, type SteerPoller } from "./steer.ts";
 
@@ -388,8 +388,29 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    const reason = (event as any)?.reason as string | undefined;
     stopSteerPolling();
-    recorder.sessionShutdown((event as any).reason);
+    recorder.sessionShutdown(reason);
+
+    // A real quit (Ctrl+C / Ctrl+D / SIGHUP / SIGTERM) never runs
+    // subagent_done, so without a sidecar the parent would have to detect the
+    // end by reading the pane sentinel — which fails whenever its polling
+    // loop is gone or the pane is not readable. Leave a shutdown sidecar so a
+    // live watcher always reaps this subagent. Session switches (new/resume/
+    // fork) and reloads do NOT end the subagent and must not write it.
+    if (reason === "quit") {
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (sessionFile) {
+        try {
+          const exitFile = `${sessionFile}.exit`;
+          if (!existsSync(exitFile)) {
+            writeFileSync(exitFile, JSON.stringify({ type: "shutdown" }));
+          }
+        } catch {
+          // Best effort — the parent falls back to sentinel detection.
+        }
+      }
+    }
   });
 
   // Toggle expand/collapse with Ctrl+Shift+J (ctrl+j alone is pi built-in newline)

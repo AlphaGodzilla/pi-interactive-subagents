@@ -20,6 +20,9 @@ import { basename, dirname, join } from "node:path";
 // Calls that pass their own `stdio` (e.g. `{ stdio: "ignore" }`) keep it.
 const CLI_STDIO: ["ignore", "pipe", "pipe"] = ["ignore", "pipe", "pipe"];
 
+/** Upper bound for a single async pane read, so one stuck call cannot hang the watcher. */
+const PANE_READ_TIMEOUT_MS = 5000;
+
 function withCliStdio(options?: Record<string, unknown>): Record<string, unknown> {
   return { stdio: CLI_STDIO, ...options };
 }
@@ -1698,7 +1701,9 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
       execFileAsync(
         "herdr",
         ["pane", "read", surface, "--source", source, "--lines", lineArg],
-        { encoding: "utf8" },
+        // Bound every read: a single stuck CLI call must not pin the polling
+        // loop (and with it the whole watcher) forever.
+        { encoding: "utf8", timeout: PANE_READ_TIMEOUT_MS },
       );
     const { stdout: recent } = await readPane("recent-unwrapped");
     if (recent.trim()) return recent;
@@ -1893,6 +1898,9 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
+  // "shutdown": the subagent's pi quit (Ctrl+C / Ctrl+D / signal) without
+  // calling subagent_done. Treat it as a normal end — the parent reaps the
+  // pane and derives the summary from the session file, like "done".
   return { reason: "done", exitCode: 0 };
 }
 
