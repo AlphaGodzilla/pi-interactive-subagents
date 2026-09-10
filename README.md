@@ -247,8 +247,11 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 **`subagent_resume` parameters:**
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
+- `mux` (optional): Surface mode — `pane` (default) splits a pane; `tab` opens a tab (mirrors the spawn `mux` behavior)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+
+Surface placement mirrors subagent spawning. The resumed session's recorded working directory (from its session header) is restored with `cd`; when that directory is a **still-existing herdr Git worktree**, the session lands back in the worktree's own workspace (reusing the fresh root pane, or a new tab when the workspace was already open) exactly like the `worktree` spawn parameter, and the workspace is reaped again once the resumed session finishes.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`

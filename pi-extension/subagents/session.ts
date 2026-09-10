@@ -1,4 +1,13 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  copyFileSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -78,6 +87,39 @@ function readEntries(sessionFile: string): SessionEntry[] {
 /**
  * Return the id of the last entry in the session file (current branch point / leaf).
  */
+/**
+ * Read the working directory recorded in a pi session's header (the first
+ * line of the session .jsonl). Used by subagent_resume to send a resumed
+ * session back to its original checkout (and, when that checkout is a herdr
+ * worktree, back into its worktree workspace).
+ *
+ * Only the first chunk is read — session files can grow large, and the header
+ * always sits at the very top. Returns undefined when the file is missing,
+ * unreadable, or carries no cwd.
+ */
+export function getSessionCwd(sessionFile: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(sessionFile, "r");
+    const buf = Buffer.alloc(65536);
+    const bytes = readSync(fd, buf, 0, buf.length, 0);
+    if (bytes <= 0) return undefined;
+    const firstLine = buf.subarray(0, bytes).toString("utf8").split("\n", 1)[0];
+    const header = JSON.parse(firstLine);
+    return typeof header?.cwd === "string" && header.cwd.length > 0 ? header.cwd : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing to do.
+      }
+    }
+  }
+}
+
 export function getLeafId(sessionFile: string): string | null {
   const entries = readEntries(sessionFile);
   return entries.length > 0 ? entries[entries.length - 1].id : null;

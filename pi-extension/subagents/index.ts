@@ -25,6 +25,8 @@ import {
   listSubagentPanes,
   listAllSurfaces,
   resolveWorktreeContext,
+  findWorktreeContextByPath,
+  sendEnter,
   type HerdrWorktreeContext,
   getMuxBackend,
   sendEscape,
@@ -35,6 +37,7 @@ import {
 import {
   findLastAssistantMessage,
   getNewEntries,
+  getSessionCwd,
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
@@ -2592,15 +2595,46 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+/**
+ * pi greets a resumed session whose recorded working directory no longer
+ * exists with an interactive Continue/Cancel prompt. Our launches are
+ * unattended, so watch the pane briefly and confirm "Continue" (Enter) for
+ * the user; the session then continues in the directory we launched it in.
+ */
+async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    let screen = "";
+    try {
+      screen = readScreen(surface, 40);
+    } catch {
+      continue; // Pane not readable yet — keep watching.
+    }
+    if (/continue in current cwd|cwd from session file does not exist/i.test(screen)) {
+      try {
+        sendEnter(surface);
+      } catch {
+        // The pane may have vanished; nothing else to do.
+      }
+      return;
+    }
+  }
+}
+
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
     pi.registerTool({
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane — use it to re-attach to a cancelled/orphaned " +
+        "Resume a previous sub-agent session in a new multiplexer surface — use it to re-attach to a cancelled/orphaned " +
         "sub-agent or to give a finished one follow-up work (the session path is printed in the subagent's result " +
         "message: `Session: <path>` / `Resume: pi --session <path>`). " +
+        "Surface placement mirrors subagent spawning: `mux: \"pane\"` (default) splits a pane; `mux: \"tab\"` opens a tab. " +
+        "When the session's recorded working directory is a herdr Git worktree that still exists, the resumed session " +
+        "lands back in that worktree's own workspace (reusing the fresh root pane / opening a tab when already open) " +
+        "and runs inside the worktree directory. " +
         "Fire-and-forget: the call returns immediately; when the resumed session finishes, its result arrives " +
         "automatically as a steer message. Never poll for status. " +
         "The name parameter here is only the terminal tab label — it does NOT select a running subagent.",
@@ -2610,6 +2644,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
           Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+        ),
+        mux: Type.Optional(
+          Type.Union([Type.Literal("pane"), Type.Literal("tab")], {
+            description:
+              "Surface mode for the resumed session: \"pane\" (default) splits a pane; \"tab\" opens a tab " +
+              "(in the spawning agent's workspace, or in the session's original worktree workspace when detected).",
+          }),
         ),
         message: Type.Optional(
           Type.String({
@@ -2675,7 +2716,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSurface(name);
+        // Bring the resumed session back to its original checkout when it
+        // still exists, and — when that checkout is a herdr worktree — reuse
+        // the worktree's own workspace with the same fresh/already-open
+        // placement model as the `worktree` spawn parameter.
+        const sessionCwd = getSessionCwd(params.sessionPath);
+        const sessionCwdUsable = sessionCwd !== undefined && existsSync(sessionCwd);
+        let resumeWorktree: HerdrWorktreeContext | undefined;
+        if (sessionCwdUsable) {
+          const found = findWorktreeContextByPath(sessionCwd);
+          if (found.ok) resumeWorktree = found.context;
+        }
+        const effectiveCwd = resumeWorktree?.path ?? (sessionCwdUsable ? sessionCwd : undefined);
+
+        const surface = createSurface(name, {
+          mode: params.mux ?? "pane",
+          worktree: resumeWorktree
+            ? {
+                workspaceId: resumeWorktree.workspaceId,
+                rootPane: resumeWorktree.rootPane,
+                rootTabId: resumeWorktree.rootTabId,
+                fresh: resumeWorktree.openedByUs,
+              }
+            : undefined,
+        });
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
@@ -2720,12 +2784,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         resumeEnvParts.push(`PI_SUBAGENT_STEER_FILE=${shellEscape(steerFile)}`);
+        if (resumeWorktree) {
+          resumeEnvParts.push(`PI_SUBAGENT_WORKTREE_WORKSPACE=${shellEscape(resumeWorktree.workspaceId)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_WORKTREE_ROOT_PANE=${shellEscape(resumeWorktree.rootPane)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_WORKTREE_REAP=${resumeWorktree.openedByUs ? "1" : "0"}`);
+        }
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+        const command = `${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2747,6 +2817,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ].join("\n"),
         });
 
+        // The session's original directory is gone — pi will ask Continue vs
+        // Cancel on startup. Nobody is watching the pane, so confirm Continue.
+        if (sessionCwd !== undefined && !sessionCwdUsable) {
+          void autoConfirmMissingSessionCwd(surface).catch(() => {});
+        }
+
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
@@ -2758,6 +2834,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           steerFile,
+          ...(resumeWorktree
+            ? {
+                worktree: {
+                  workspaceId: resumeWorktree.workspaceId,
+                  rootPane: resumeWorktree.rootPane,
+                  reap: resumeWorktree.openedByUs,
+                },
+              }
+            : {}),
           interactive,
           statusState: createStatusState({
             source: "pi",

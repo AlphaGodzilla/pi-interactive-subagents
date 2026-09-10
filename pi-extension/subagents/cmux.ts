@@ -5,7 +5,7 @@ import {
   spawnSync,
 } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -932,6 +932,96 @@ export function parseWorktreeCommandOutput(output: string): HerdrWorktreeContext
  * are opened as-is; missing ones are created as a sibling directory named
  * `<repo-dir>-<name>` on a new branch `name`.
  */
+/** Normalize a filesystem path for comparison: resolve symlinks when possible, strip trailing slashes. */
+function normalizeComparablePath(p: string): string {
+  let out = p;
+  try {
+    out = realpathSync(p);
+  } catch {
+    // Keep the raw path — the caller decides what to do with a mismatch.
+  }
+  return out.replace(/\/+$/, "");
+}
+
+/** Pick the worktree entry whose checkout is exactly `path` (pure, unit-testable). */
+export function pickWorktreeByPath(
+  worktrees: HerdrWorktreeEntry[],
+  path: string,
+): HerdrWorktreeEntry | undefined {
+  const target = path.replace(/\/+$/, "");
+  return worktrees.find((w) => typeof w.path === "string" && w.path.replace(/\/+$/, "") === target);
+}
+
+/**
+ * Locate the herdr worktree workspace for an existing checkout `worktreePath`
+ * (used by subagent_resume to send a resumed session back into the worktree
+ * it originally ran in). The workspace is opened via `herdr worktree open`
+ * when not already open, and `openedByUs` reports whether this call opened it
+ * (true) or it was already open (false) — the same fresh/already-open model
+ * used by the `worktree` spawn parameter.
+ *
+ * Fails (returns ok:false) for anything that is not a linked worktree tracked
+ * by herdr — including plain directories and main checkouts — so callers can
+ * fall back to a regular placement.
+ */
+export function findWorktreeContextByPath(
+  worktreePath: string,
+): { ok: true; context: HerdrWorktreeContext } | { ok: false; error: string } {
+  const backend = getMuxBackend();
+  if (backend !== "herdr") {
+    return {
+      ok: false,
+      error: `Worktree reuse requires the herdr multiplexer (current backend: ${backend ?? "none"}).`,
+    };
+  }
+  if (!existsSync(worktreePath)) {
+    return { ok: false, error: `Worktree path does not exist: ${worktreePath}` };
+  }
+
+  let topLevel = "";
+  let gitDir = "";
+  let commonDir = "";
+  try {
+    topLevel = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: worktreePath, encoding: "utf8" }).trim();
+    gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: worktreePath, encoding: "utf8" }).trim();
+    commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: worktreePath,
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    return { ok: false, error: `Not a Git checkout: ${worktreePath}` };
+  }
+
+  if (normalizeComparablePath(topLevel) !== normalizeComparablePath(worktreePath)) {
+    return { ok: false, error: `Not a Git worktree root: ${worktreePath}` };
+  }
+  if (commonDir === gitDir) {
+    // The git dir and the common dir coincide on the main checkout — linked
+    // worktrees have their git dir under <main>/.git/worktrees/<name>.
+    return { ok: false, error: `Not a linked worktree (main checkout): ${worktreePath}` };
+  }
+
+  const mainRoot = dirname(commonDir);
+  try {
+    const listRaw = execFileSync("herdr", ["worktree", "list", "--cwd", mainRoot], { encoding: "utf8" });
+    const worktrees = (JSON.parse(listRaw)?.result?.worktrees ?? []) as HerdrWorktreeEntry[];
+    const existing = pickWorktreeByPath(worktrees, worktreePath);
+    if (!existing) {
+      return { ok: false, error: `Worktree is not tracked by herdr: ${worktreePath}` };
+    }
+    const out = execFileSync("herdr", ["worktree", "open", "--cwd", mainRoot, "--path", existing.path], {
+      encoding: "utf8",
+    });
+    return { ok: true, context: parseWorktreeCommandOutput(out) };
+  } catch (error: any) {
+    const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+    return {
+      ok: false,
+      error: `Failed to open the worktree workspace for "${worktreePath}": ${stderr || error?.message || String(error)}`,
+    };
+  }
+}
+
 export function resolveWorktreeContext(
   name: string,
   cwd: string,
@@ -1449,6 +1539,37 @@ export function sendEscape(surface: string): void {
   }
 
   zellijActionSync(["write", "27"], surface);
+}
+
+/**
+ * Send one Enter keypress to an active pane (e.g. to confirm a prompt).
+ */
+export function sendEnter(surface: string): void {
+  const backend = requireMuxBackend();
+
+  if (backend === "cmux") {
+    execFileSync("cmux", ["send", "--surface", surface, "\n"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "tmux") {
+    execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "herdr") {
+    execFileSync("herdr", ["pane", "send-keys", surface, "enter"], { encoding: "utf8" });
+    return;
+  }
+
+  if (backend === "wezterm") {
+    execFileSync("wezterm", ["cli", "send-text", "--pane-id", surface, "--no-paste", "\r"], {
+      encoding: "utf8",
+    });
+    return;
+  }
+
+  zellijActionSync(["write", "13"], surface);
 }
 
 /**

@@ -10,6 +10,7 @@ import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   getLeafId,
   getNewEntries,
+  getSessionCwd,
   findLastAssistantMessage,
   appendBranchSummary,
   copySessionFile,
@@ -28,6 +29,7 @@ import {
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
   buildHerdrTabCreateArgs,
+  pickWorktreeByPath,
   parseHerdrTabCreateOutput,
   resolveSurfaceRequest,
   buildWorktreeTargetPath,
@@ -237,6 +239,27 @@ const TOOL_RESULT = {
 // --- Tests ---
 
 describe("session.ts", () => {
+  it("reads the cwd from a session header and tolerates bad input", () => {
+    withTempDir((dir) => {
+      const full = join(dir, "full.jsonl");
+      writeFileSync(
+        full,
+        JSON.stringify({ type: "session", version: 3, cwd: "/repo/proj-wt-1" }) + "\n" + '{"type":"model_change"}\n',
+      );
+      assert.equal(getSessionCwd(full), "/repo/proj-wt-1");
+
+      const noCwd = join(dir, "no-cwd.jsonl");
+      writeFileSync(noCwd, '{"type":"session","version":3}\n');
+      assert.equal(getSessionCwd(noCwd), undefined);
+
+      const broken = join(dir, "broken.jsonl");
+      writeFileSync(broken, "not-json\n");
+      assert.equal(getSessionCwd(broken), undefined);
+
+      assert.equal(getSessionCwd(join(dir, "missing.jsonl")), undefined);
+    });
+  });
+
   let dir: string;
 
   before(() => {
@@ -1004,6 +1027,17 @@ describe("subagent discovery", () => {
     assert.equal(pickExistingWorktree(byBasename, "hotfix-issue-20", target)?.path, "/another/dir/my-project-hotfix-issue-20");
 
     assert.equal(pickExistingWorktree([{ path: "/repo/main" }], "hotfix-issue-20", target), undefined);
+  });
+
+  it("picks a worktree by exact checkout path (trailing slash tolerated)", () => {
+    const worktrees = [
+      { path: "/repo/main" },
+      { path: "/repo-probe-1", branch: "probe-1" },
+      { path: "/repo-probe-2/", branch: "probe-2" },
+    ];
+    assert.equal(pickWorktreeByPath(worktrees, "/repo-probe-1")?.branch, "probe-1");
+    assert.equal(pickWorktreeByPath(worktrees, "/repo-probe-2")?.branch, "probe-2");
+    assert.equal(pickWorktreeByPath(worktrees, "/repo-probe-3"), undefined);
   });
 
   it("parses herdr worktree create/open output", () => {
