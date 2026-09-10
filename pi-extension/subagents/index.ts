@@ -625,6 +625,12 @@ interface RunningSubagent {
   abortController?: AbortController;
   /** How this subagent's surface was opened (pane split or tab). */
   muxMode?: SubagentMuxMode;
+  /**
+   * Set when this subagent runs inside a herdr git-worktree workspace. `reap`
+   * means the workspace was opened by this spawn (safe to close once every
+   * subagent placed there finished); already-open user workspaces are kept.
+   */
+  worktree?: { workspaceId: string; rootPane: string; reap: boolean };
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -1070,6 +1076,28 @@ function handleSubagentSteer(
  *   (its pane is closed and its pending result is abandoned).
  * - Without: clean every entry currently classified as `stalled`.
  */
+/**
+ * Close a herdr git-worktree workspace once every subagent placed there has
+ * finished. Only workspaces this session opened/created are reaped (`reap`);
+ * a workspace the user already had open is left running. Closing the root pane
+ * makes herdr recycle the workspace itself; the git worktree checkout stays on
+ * disk and is reused by the next spawn.
+ */
+function maybeReapWorktreeWorkspace(
+  worktree: RunningSubagent["worktree"],
+  closeSurfaceFn: (surface: string) => void = closeSurface,
+): void {
+  if (!worktree || !worktree.reap || !worktree.rootPane) return;
+  for (const running of runningSubagents.values()) {
+    if (running.worktree?.workspaceId === worktree.workspaceId) return;
+  }
+  try {
+    closeSurfaceFn(worktree.rootPane);
+  } catch {
+    // Best effort: the pane/workspace may already be gone.
+  }
+}
+
 function handleSubagentCleanup(
   params: { id?: string; name?: string; surface?: string },
   closeSurfaceFn: (surface: string) => void = closeSurface,
@@ -1100,6 +1128,7 @@ function handleSubagentCleanup(
         tracked.abortController?.abort();
       } catch {}
       runningSubagents.delete(tracked.id);
+      maybeReapWorktreeWorkspace(tracked.worktree, closeSurfaceFn);
       updateWidget();
     }
     const trackedNote = tracked ? ` (running entry "${tracked.name}" [${tracked.id}] removed)` : "";
@@ -1154,8 +1183,18 @@ function handleSubagentCleanup(
       closeSurfaceFn(running.surface);
     } catch {}
     runningSubagents.delete(running.id);
-    return { id: running.id, name: running.name, surface: running.surface };
+    return { id: running.id, name: running.name, surface: running.surface, worktree: running.worktree };
   });
+
+  // Reap any worktree workspaces whose last subagent just finished.
+  const reaped = new Set<string>();
+  for (const c of cleaned) {
+    const wt = c.worktree;
+    if (wt?.reap && wt.rootPane && !reaped.has(wt.workspaceId)) {
+      reaped.add(wt.workspaceId);
+      maybeReapWorktreeWorkspace(wt, closeSurfaceFn);
+    }
+  }
 
   updateWidget();
 
@@ -1447,6 +1486,7 @@ export const __test__ = {
   handleSubagentSteer,
   handleSubagentCleanup,
   handleSubagentsStatus,
+  maybeReapWorktreeWorkspace,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   resolveParentModel,
@@ -1513,6 +1553,25 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
+  // A direct `worktree` param places this spawn; nested subagents inherit the
+  // enclosing worktree workspace through the env injected below, so they also
+  // count toward "all tasks finished" for that workspace.
+  const inheritedWorktreeWorkspace = process.env.PI_SUBAGENT_WORKTREE_WORKSPACE;
+  const effectiveWorktree: { workspaceId: string; rootPane: string; reap: boolean } | undefined =
+    options?.worktree
+      ? {
+          workspaceId: options.worktree.workspaceId,
+          rootPane: options.worktree.rootPane,
+          reap: options.worktree.openedByUs,
+        }
+      : inheritedWorktreeWorkspace
+        ? {
+            workspaceId: inheritedWorktreeWorkspace,
+            rootPane: process.env.PI_SUBAGENT_WORKTREE_ROOT_PANE ?? "",
+            reap: process.env.PI_SUBAGENT_WORKTREE_REAP === "1",
+          }
+        : undefined;
+
   const surface = options?.surface ?? createSurface(params.name, {
     mode: resolveMuxMode(agentDefs),
     worktree: options?.worktree
@@ -1616,6 +1675,7 @@ async function launchSubagent(
       sessionFile: subagentSessionFile,
       launchScriptFile,
       muxMode: resolveMuxMode(agentDefs),
+      ...(effectiveWorktree ? { worktree: effectiveWorktree } : {}),
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
@@ -1711,6 +1771,11 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_STEER_FILE=${shellEscape(steerFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  if (effectiveWorktree) {
+    envParts.push(`PI_SUBAGENT_WORKTREE_WORKSPACE=${shellEscape(effectiveWorktree.workspaceId)}`);
+    envParts.push(`PI_SUBAGENT_WORKTREE_ROOT_PANE=${shellEscape(effectiveWorktree.rootPane)}`);
+    envParts.push(`PI_SUBAGENT_WORKTREE_REAP=${effectiveWorktree.reap ? "1" : "0"}`);
+  }
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1778,6 +1843,7 @@ async function launchSubagent(
     activityFile,
     steerFile,
     muxMode: resolveMuxMode(agentDefs),
+    ...(effectiveWorktree ? { worktree: effectiveWorktree } : {}),
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1865,6 +1931,7 @@ async function watchSubagent(
 
       closeSurface(surface);
       runningSubagents.delete(running.id);
+      maybeReapWorktreeWorkspace(running.worktree);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1901,6 +1968,7 @@ async function watchSubagent(
 
     closeSurface(surface);
     runningSubagents.delete(running.id);
+    maybeReapWorktreeWorkspace(running.worktree);
 
     return {
       name,
@@ -1925,6 +1993,7 @@ async function watchSubagent(
       closeSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
+    maybeReapWorktreeWorkspace(running.worktree);
 
     if (signal.aborted) {
       return {
@@ -2048,7 +2117,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let worktree: HerdrWorktreeContext | undefined;
         const requestedWorktree = params.worktree?.trim();
         if (requestedWorktree) {
-          const resolved = resolveWorktreeContext(requestedWorktree, ctx.cwd);
+          // Locate the repo from the spawn's cwd when given (absolute or
+          // relative to the session cwd), otherwise from the session cwd.
+          const worktreeBaseDir = params.cwd
+            ? params.cwd.startsWith("/")
+              ? params.cwd
+              : join(process.cwd(), params.cwd)
+            : ctx.cwd;
+          const resolved = resolveWorktreeContext(requestedWorktree, worktreeBaseDir);
           if (!resolved.ok) {
             return {
               content: [{ type: "text", text: resolved.error }],

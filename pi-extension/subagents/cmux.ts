@@ -819,6 +819,12 @@ export interface HerdrWorktreeContext {
   workspaceId: string;
   rootPane: string;
   path: string;
+  /**
+   * True when this spawn opened/created the workspace (safe to close it once
+   * every subagent placed there finished). False when the worktree workspace
+   * was already open — the user is working in it, so leave it alone.
+   */
+  openedByUs: boolean;
 }
 
 /**
@@ -860,7 +866,10 @@ export function parseWorktreeCommandOutput(output: string): HerdrWorktreeContext
   if (typeof workspaceId !== "string" || typeof rootPane !== "string" || typeof path !== "string") {
     throw new Error(`Unexpected herdr worktree output: ${output}`);
   }
-  return { workspaceId, rootPane, path };
+  // `already_open: true` (worktree open) means the workspace predates this
+  // call; create never sets it, so freshly created workspaces are ours.
+  const openedByUs = parsed?.result?.already_open !== true;
+  return { workspaceId, rootPane, path, openedByUs };
 }
 
 /**

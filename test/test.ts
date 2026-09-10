@@ -1019,7 +1019,22 @@ describe("subagent discovery", () => {
       workspaceId: "w7",
       rootPane: "w7:p1",
       path: "/repo/proj-probe-wt-1",
+      openedByUs: true,
     });
+
+    // `already_open: true` (worktree open on a pre-existing workspace): the
+    // user was already there, so the workspace must not be auto-reaped.
+    const alreadyOpen = JSON.stringify({
+      id: "cli:worktree:open",
+      result: {
+        already_open: true,
+        workspace: { workspace_id: "w9" },
+        root_pane: { pane_id: "w9:p1" },
+        worktree: { path: "/repo/proj-wt" },
+      },
+    });
+    assert.equal(parseWorktreeCommandOutput(alreadyOpen).openedByUs, false);
+
     assert.throws(() => parseWorktreeCommandOutput("not json"), /Unexpected herdr worktree output/);
     assert.throws(() => parseWorktreeCommandOutput("{}"), /Unexpected herdr worktree output/);
   });
@@ -2484,6 +2499,40 @@ describe("subagent interruption", () => {
       testApi.handleSubagentCleanup({ surface: "pane-t1" }, () => {});
       assert.equal((globalThis as any).__piSubagentRunningRegistry.size, 0);
       assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reaps a worktree workspace only after its last subagent finishes", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    runningMap.clear();
+
+    try {
+      const wt = { workspaceId: "w9", rootPane: "w9:p1", reap: true };
+      runningMap.set("a1", makeRunning({ id: "a1", surface: "w9:p2", worktree: wt }));
+      runningMap.set("b2", makeRunning({ id: "b2", surface: "w9:p3", worktree: { ...wt } }));
+
+      // Another subagent still lives in the workspace: keep it open.
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface));
+      assert.deepEqual(closed, []);
+
+      // Last one gone: the root pane is closed (herdr recycles the workspace).
+      runningMap.delete("a1");
+      runningMap.delete("b2");
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface));
+      assert.deepEqual(closed, ["w9:p1"]);
+
+      // User-opened workspaces are never reaped.
+      closed.length = 0;
+      testApi.maybeReapWorktreeWorkspace({ workspaceId: "w9", rootPane: "w9:p1", reap: false }, (s: string) => closed.push(s));
+      assert.deepEqual(closed, []);
+
+      // No worktree info at all: nothing to do.
+      testApi.maybeReapWorktreeWorkspace(undefined, (s: string) => closed.push(s));
+      assert.deepEqual(closed, []);
     } finally {
       runningMap.clear();
     }

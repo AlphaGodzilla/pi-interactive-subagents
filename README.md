@@ -317,6 +317,8 @@ The tab is created in the **spawning agent's workspace** (herdr `tab create --wo
 
 With the `worktree` spawn parameter, the surface is instead placed inside the worktree's own herdr workspace: pane mode splits inside that workspace's root pane, tab mode opens the tab there. `herdr worktree list/open/create` are used to reuse an existing worktree or create a missing one (`<repo-dir>-<name>` sibling checkout, branch `name`).
 
+The worktree workspace is **closed automatically once its last subagent finishes** (closing the root pane lets herdr recycle the workspace; the git checkout stays on disk for reuse). This applies only when the spawn opened/created the workspace — a worktree workspace the user already had open is left untouched. Nested subagents spawned inside that workspace count as part of it, so the workspace stays open until all of them are done.
+
 **Nested subagents.** A nested subagent using the default pane mode is split inside its parent's tab — pane splits always target the spawning parent's own pane, never the focused one. A nested subagent that explicitly declares `mux: tab` still gets its own new tab.
 
 Closing follows herdr's own semantics: the tab creator is the subagent whose pane is the tab's root pane. When that subagent exits, its pane is closed and the tab is reaped automatically **only if no other pane remains in it** — panes split inside the tab (user splits or nested subagents) keep the tab alive, and their own exits never close the tab. `subagent_cleanup` reaps dead tab-mode subagents the same way (closing the root pane, which reaps an otherwise-empty tab).
