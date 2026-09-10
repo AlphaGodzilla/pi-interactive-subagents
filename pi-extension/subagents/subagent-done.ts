@@ -45,6 +45,20 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
+/**
+ * Running-subagent registry shared by the orchestrator extension (index.ts)
+ * in the same pi process. While this session has spawned subagents that are
+ * still running, auto-exit must wait: their completion arrives as a steer
+ * message that needs this session alive, and exiting early strands them and
+ * fails the task.
+ */
+const RUNNING_REGISTRY_KEY = "__piSubagentRunningRegistry";
+
+export function hasRunningSubagents(globalObj: any = globalThis): boolean {
+  const registry = globalObj?.[RUNNING_REGISTRY_KEY] as { size?: number } | undefined;
+  return !!registry && typeof registry.size === "number" && registry.size > 0;
+}
+
 export function shouldAutoExitOnAgentEnd(
   _userTookOver: boolean,
   messages: any[] | undefined,
@@ -245,6 +259,15 @@ export default function (pi: ExtensionAPI) {
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
+      // Never exit while spawned subagents are still running: their results
+      // arrive as steer messages that wake this session; exiting now strands
+      // them and fails the whole task (seen with auto-exit orchestrator
+      // agents that spawn a reviewer and end their turn to wait).
+      if (hasRunningSubagents()) {
+        recorder.agentEndWaiting();
+        return;
+      }
+
       // A stopReason="error" turn is NOT the end of the run: pi's agent loop
       // retries provider errors with exponential backoff (settings.retry)
       // AFTER agent_end, before the run settles. Exiting here — as auto-exit
@@ -259,7 +282,27 @@ export default function (pi: ExtensionAPI) {
       }
       deferredErrorExit = null;
       recorder.agentEndDone();
-      ctx.shutdown();
+      // Defer the actual exit briefly: a child may have JUST finished (its
+      // registry entry removed) while its completion steer is still being
+      // delivered — exiting immediately would swallow that message and the
+      // follow-up turn it would have started. Re-check running children and
+      // session idleness before shutting down.
+      const deadline = Date.now() + 1500;
+      const confirmExit = () => {
+        if (hasRunningSubagents()) return;
+        let idle = false;
+        try {
+          idle = ctx.isIdle();
+        } catch {
+          idle = true;
+        }
+        if (!idle && Date.now() < deadline) {
+          setTimeout(confirmExit, 200);
+          return;
+        }
+        ctx.shutdown();
+      };
+      setTimeout(confirmExit, 300);
       return;
     }
 
@@ -278,6 +321,9 @@ export default function (pi: ExtensionAPI) {
   // down. If the user took over the pane meanwhile, leave the session open.
   pi.on("agent_settled", (event, ctx) => {
     if (!deferredErrorExit) return;
+    // Children still running: keep the session alive so their results can
+    // arrive; the exit decision is re-evaluated on the next agent_end.
+    if (hasRunningSubagents()) return;
     const errorInfo = deferredErrorExit;
     deferredErrorExit = null;
     if (userTookOver) return;

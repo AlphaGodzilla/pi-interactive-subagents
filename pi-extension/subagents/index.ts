@@ -632,6 +632,15 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/**
+ * Share the running registry with sibling extensions in the same pi process
+ * (subagent-done.ts refuses to auto-exit while spawned subagents are still
+ * running). Deliberately on globalThis: both extensions are separate modules
+ * loaded into the same session.
+ */
+const RUNNING_REGISTRY_GLOBAL_KEY = "__piSubagentRunningRegistry";
+(globalThis as any)[RUNNING_REGISTRY_GLOBAL_KEY] = runningSubagents;
+
 // ── Widget management ──
 
 /** Latest ExtensionContext from session_start, used for widget updates. */

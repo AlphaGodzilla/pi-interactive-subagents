@@ -59,7 +59,7 @@ import {
   findLatestAssistantError,
   resolveSteerPolling,
 } from "../pi-extension/subagents/subagent-done.ts";
-import subagentDoneDefault from "../pi-extension/subagents/subagent-done.ts";
+import subagentDoneDefault, { hasRunningSubagents } from "../pi-extension/subagents/subagent-done.ts";
 import {
   appendSteerMessage,
   createSteerPoller,
@@ -985,6 +985,11 @@ describe("subagent discovery", () => {
     assert.deepEqual(buildHerdrTabCreateArgs("Scout", "/tmp/work"), [
       "tab", "create", "--label", "Scout", "--cwd", "/tmp/work", "--no-focus",
     ]);
+    // An explicit workspace keeps the tab in the spawning agent's workspace,
+    // not the focused one.
+    assert.deepEqual(buildHerdrTabCreateArgs("Scout", "/tmp/work", "w1"), [
+      "tab", "create", "--workspace", "w1", "--label", "Scout", "--cwd", "/tmp/work", "--no-focus",
+    ]);
 
     const output = JSON.stringify({
       id: "cli:tab:create",
@@ -1438,6 +1443,7 @@ describe("subagent-done.ts", () => {
       };
       const ctx = {
         shutdown: () => calls.push("shutdown"),
+        isIdle: () => true,
         ui: { setWidget: () => {} },
       };
       subagentDoneDefault(pi as any);
@@ -1465,10 +1471,49 @@ describe("subagent-done.ts", () => {
       rmSync(sessionFile + ".exit", { force: true });
     });
 
-    it("shuts down immediately on a normal (non-error) agent_end", () => {
+    it("shuts down shortly after a normal (non-error) agent_end", async () => {
       const { handlers, ctx, calls } = createHarness();
       handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("stop")] }, ctx);
+      assert.deepEqual(calls, [], "exit is deferred one confirm window");
+      await new Promise((resolve) => setTimeout(resolve, 450));
       assert.deepEqual(calls, ["shutdown"]);
+    });
+
+    it("stays open while spawned subagents are still running", async () => {
+      const { handlers, ctx, calls } = createHarness();
+      const saved = (globalThis as any).__piSubagentRunningRegistry;
+      const registry = { size: 1 };
+      (globalThis as any).__piSubagentRunningRegistry = registry;
+      try {
+        handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("stop")] }, ctx);
+        await new Promise((resolve) => setTimeout(resolve, 450));
+        assert.deepEqual(calls, [], "must not exit while a child subagent is running");
+
+        // Child finished and the registry drained: the next normal agent_end exits.
+        registry.size = 0;
+        handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("stop")] }, ctx);
+        await new Promise((resolve) => setTimeout(resolve, 450));
+        assert.deepEqual(calls, ["shutdown"]);
+      } finally {
+        if (saved === undefined) delete (globalThis as any).__piSubagentRunningRegistry;
+        else (globalThis as any).__piSubagentRunningRegistry = saved;
+      }
+    });
+
+    it("detects running children from the shared registry", () => {
+      const saved = (globalThis as any).__piSubagentRunningRegistry;
+      try {
+        delete (globalThis as any).__piSubagentRunningRegistry;
+        assert.equal(hasRunningSubagents(), false);
+        (globalThis as any).__piSubagentRunningRegistry = { size: 0 };
+        assert.equal(hasRunningSubagents(), false);
+        (globalThis as any).__piSubagentRunningRegistry = { size: 2 };
+        assert.equal(hasRunningSubagents(), true);
+        assert.equal(hasRunningSubagents({}), false);
+      } finally {
+        if (saved === undefined) delete (globalThis as any).__piSubagentRunningRegistry;
+        else (globalThis as any).__piSubagentRunningRegistry = saved;
+      }
     });
 
     it("keeps the session open when the user took over before agent_settled", () => {
@@ -1481,11 +1526,12 @@ describe("subagent-done.ts", () => {
       assert.equal(existsSync(sessionFile + ".exit"), false);
     });
 
-    it("resets the deferred error when a later agent_end completes normally", () => {
+    it("resets the deferred error when a later agent_end completes normally", async () => {
       const { handlers, ctx, calls } = createHarness();
       handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("error", "transient")] }, ctx);
       // pi retried and the run then completed normally
       handlers.get("agent_end")?.({ type: "agent_end", messages: [errorMessage("stop")] }, ctx);
+      await new Promise((resolve) => setTimeout(resolve, 450));
       assert.deepEqual(calls, ["shutdown"]);
       handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
       assert.deepEqual(calls, ["shutdown"], "no second exit after settle");
@@ -2361,6 +2407,28 @@ describe("subagent interruption", () => {
       );
       assert.match(failed.content[0].text, /Failed to close surface "pane-gone"/);
       assert.match(failed.content[0].text, /pane not found/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("shares the running registry with the auto-exit guard (same Map reference)", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      // The guard reads globalThis.__piSubagentRunningRegistry; cleanup, the
+      // watcher and spawn all mutate this very Map, so removals are visible
+      // to hasRunningSubagents() immediately.
+      assert.equal((globalThis as any).__piSubagentRunningRegistry, runningMap);
+
+      runningMap.set("t1", makeRunning({ id: "t1", name: "TabWorker", surface: "pane-t1", muxMode: "tab" }));
+      assert.equal((globalThis as any).__piSubagentRunningRegistry.size, 1);
+
+      testApi.handleSubagentCleanup({ surface: "pane-t1" }, () => {});
+      assert.equal((globalThis as any).__piSubagentRunningRegistry.size, 0);
+      assert.equal(runningMap.size, 0);
     } finally {
       runningMap.clear();
     }
