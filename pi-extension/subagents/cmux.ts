@@ -767,6 +767,12 @@ function createCmuxSplitSurface(
 export interface CreateSurfaceOptions {
   /** "tab" opens the subagent in a new tab where the backend supports it; other backends fall back to a pane split. */
   mode?: "pane" | "tab";
+  /**
+   * Herdr git-worktree workspace to place the surface in (herdr only). Pane
+   * mode splits inside that workspace's root pane; tab mode creates the tab
+   * in that workspace.
+   */
+  worktree?: { workspaceId: string; rootPane: string };
 }
 
 /**
@@ -801,6 +807,125 @@ export function resolveSurfaceRequest(
   return { mode, parentSurface };
 }
 
+/** Worktree entry shape from `herdr worktree list`. */
+export interface HerdrWorktreeEntry {
+  branch?: string;
+  label?: string;
+  path: string;
+  open_workspace_id?: string;
+}
+
+export interface HerdrWorktreeContext {
+  workspaceId: string;
+  rootPane: string;
+  path: string;
+}
+
+/**
+ * Target checkout path for a worktree named `name`: a sibling of the repo
+ * directory, prefixed with the repo directory name (e.g. my-project-hotfix-20
+ * next to my-project). Pure, unit-testable.
+ */
+export function buildWorktreeTargetPath(repoRoot: string, name: string): string {
+  return join(dirname(repoRoot), `${basename(repoRoot)}-${name}`);
+}
+
+/**
+ * Pick the existing worktree matching `name`/`targetPath` from a
+ * `herdr worktree list` result. Pure, unit-testable.
+ */
+export function pickExistingWorktree(
+  worktrees: HerdrWorktreeEntry[],
+  name: string,
+  targetPath: string,
+): HerdrWorktreeEntry | undefined {
+  return (
+    worktrees.find((w) => w.path === targetPath) ??
+    worktrees.find((w) => w.label === name || w.branch === name) ??
+    worktrees.find((w) => basename(w.path) === basename(targetPath))
+  );
+}
+
+/** Parse the shared workspace/root_pane/worktree shape of herdr worktree create|open. */
+export function parseWorktreeCommandOutput(output: string): HerdrWorktreeContext {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error(`Unexpected herdr worktree output: ${output || "(empty)"}`);
+  }
+  const workspaceId = parsed?.result?.workspace?.workspace_id;
+  const rootPane = parsed?.result?.root_pane?.pane_id;
+  const path = parsed?.result?.worktree?.path;
+  if (typeof workspaceId !== "string" || typeof rootPane !== "string" || typeof path !== "string") {
+    throw new Error(`Unexpected herdr worktree output: ${output}`);
+  }
+  return { workspaceId, rootPane, path };
+}
+
+/**
+ * Resolve (open-or-create) the herdr git-worktree workspace for a subagent.
+ *
+ * Requires the herdr backend and a Git repository at `cwd`. Existing worktrees
+ * are opened as-is; missing ones are created as a sibling directory named
+ * `<repo-dir>-<name>` on a new branch `name`.
+ */
+export function resolveWorktreeContext(
+  name: string,
+  cwd: string,
+): { ok: true; context: HerdrWorktreeContext } | { ok: false; error: string } {
+  const backend = getMuxBackend();
+  if (backend !== "herdr") {
+    return {
+      ok: false,
+      error: `The "worktree" option requires the herdr multiplexer (current backend: ${backend ?? "none"}).`,
+    };
+  }
+
+  let repoRoot: string;
+  try {
+    repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" }).trim();
+  } catch {
+    return {
+      ok: false,
+      error: `The "worktree" option requires a Git repository; "${cwd}" is not inside one.`,
+    };
+  }
+  if (!repoRoot) {
+    return { ok: false, error: `The "worktree" option requires a Git repository; "${cwd}" is not inside one.` };
+  }
+
+  const targetPath = buildWorktreeTargetPath(repoRoot, name);
+  try {
+    const listRaw = execFileSync("herdr", ["worktree", "list", "--cwd", repoRoot], { encoding: "utf8" });
+    const worktrees = (JSON.parse(listRaw)?.result?.worktrees ?? []) as HerdrWorktreeEntry[];
+    const existing = pickExistingWorktree(worktrees, name, targetPath);
+    const args = existing
+      ? ["worktree", "open", "--cwd", repoRoot, "--path", existing.path]
+      : [
+          "worktree",
+          "create",
+          "--cwd",
+          repoRoot,
+          "--branch",
+          name,
+          "--path",
+          targetPath,
+          "--label",
+          name,
+          "--no-focus",
+        ];
+    const out = execFileSync("herdr", args, { encoding: "utf8" });
+    return { ok: true, context: parseWorktreeCommandOutput(out) };
+  } catch (error: any) {
+    const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+    return {
+      ok: false,
+      error: `Failed to prepare worktree "${name}": ${stderr || error?.message || String(error)}`,
+    };
+  }
+}
+
 /**
  * Args for `herdr tab create` used by the tab mux mode (pure, unit-testable).
  *
@@ -832,10 +957,10 @@ export function parseHerdrTabCreateOutput(output: string): string {
   return paneId;
 }
 
-function createHerdrTabSurface(name: string): string {
+function createHerdrTabSurface(name: string, workspaceId?: string): string {
   const output = execFileSync(
     "herdr",
-    buildHerdrTabCreateArgs(name, process.cwd(), process.env.HERDR_WORKSPACE_ID),
+    buildHerdrTabCreateArgs(name, process.cwd(), workspaceId ?? process.env.HERDR_WORKSPACE_ID),
     { encoding: "utf8" },
   ).trim();
   const paneId = parseHerdrTabCreateOutput(output);
@@ -855,6 +980,15 @@ export function createSurface(name: string, options?: CreateSurfaceOptions): str
     herdrPaneId: process.env.HERDR_PANE_ID,
     tmuxPane: process.env.TMUX_PANE,
   });
+
+  // Worktree placements (herdr git-worktree workspaces): pane mode splits
+  // inside the worktree workspace's root pane, tab mode opens a tab there.
+  if (options?.worktree && backend === "herdr") {
+    if (request.mode === "tab") {
+      return createHerdrTabSurface(name, options.worktree.workspaceId);
+    }
+    return createSurfaceSplit(name, "right", options.worktree.rootPane);
+  }
 
   if (request.mode === "tab") {
     return createHerdrTabSurface(name);

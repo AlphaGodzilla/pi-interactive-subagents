@@ -30,6 +30,9 @@ import {
   buildHerdrTabCreateArgs,
   parseHerdrTabCreateOutput,
   resolveSurfaceRequest,
+  buildWorktreeTargetPath,
+  pickExistingWorktree,
+  parseWorktreeCommandOutput,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -979,6 +982,46 @@ describe("subagent discovery", () => {
       resolveSurfaceRequest("pane", null, {}),
       { mode: "pane", parentSurface: undefined },
     );
+  });
+
+  it("derives the worktree target path and picks existing worktrees by name", () => {
+    assert.equal(
+      buildWorktreeTargetPath("/repo/my-project", "hotfix-issue-20"),
+      "/repo/my-project-hotfix-issue-20",
+    );
+
+    const target = "/repo/my-project-hotfix-issue-20";
+    const byPath = [{ path: target, branch: "other" }, { path: "/repo/elsewhere", label: "hotfix-issue-20" }];
+    assert.equal(pickExistingWorktree(byPath, "hotfix-issue-20", target)?.path, target);
+
+    const byLabel = [{ path: "/repo/weird-path", label: "hotfix-issue-20" }];
+    assert.equal(pickExistingWorktree(byLabel, "hotfix-issue-20", target)?.label, "hotfix-issue-20");
+
+    const byBranch = [{ path: "/repo/weird-path", branch: "hotfix-issue-20" }];
+    assert.equal(pickExistingWorktree(byBranch, "hotfix-issue-20", target)?.branch, "hotfix-issue-20");
+
+    const byBasename = [{ path: "/another/dir/my-project-hotfix-issue-20" }];
+    assert.equal(pickExistingWorktree(byBasename, "hotfix-issue-20", target)?.path, "/another/dir/my-project-hotfix-issue-20");
+
+    assert.equal(pickExistingWorktree([{ path: "/repo/main" }], "hotfix-issue-20", target), undefined);
+  });
+
+  it("parses herdr worktree create/open output", () => {
+    const output = JSON.stringify({
+      id: "cli:worktree:create",
+      result: {
+        workspace: { workspace_id: "w7", label: "probe-wt-1" },
+        root_pane: { pane_id: "w7:p1" },
+        worktree: { path: "/repo/proj-probe-wt-1", branch: "probe-wt-1" },
+      },
+    });
+    assert.deepEqual(parseWorktreeCommandOutput(output), {
+      workspaceId: "w7",
+      rootPane: "w7:p1",
+      path: "/repo/proj-probe-wt-1",
+    });
+    assert.throws(() => parseWorktreeCommandOutput("not json"), /Unexpected herdr worktree output/);
+    assert.throws(() => parseWorktreeCommandOutput("{}"), /Unexpected herdr worktree output/);
   });
 
   it("builds herdr tab-create args and parses its output", () => {
@@ -2244,7 +2287,19 @@ describe("subagent interruption", () => {
     assert.equal(registeredTools.some((tool) => tool.name === "subagent_cleanup"), true);
   });
 
-  it("registers subagents_status in the main session extension", () => {
+  it("documents the worktree parameter in the subagent tool schema", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const tool = registeredTools.find((t) => t.name === "subagent");
+    assert.ok(tool, "subagent tool registered");
+    const props = tool.parameters?.properties ?? {};
+    assert.ok(props.worktree, "worktree parameter present in the tool schema");
+    assert.match(props.worktree.description, /herdr only/);
+    assert.match(props.worktree.description, /<repo-dir>-<name>/);
+    assert.match(props.worktree.description, /overrides cwd/);
+  });
+
+    it("registers subagents_status in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const tool = registeredTools.find((t) => t.name === "subagents_status");

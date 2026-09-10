@@ -24,6 +24,8 @@ import {
   closeSurface,
   listSubagentPanes,
   listAllSurfaces,
+  resolveWorktreeContext,
+  type HerdrWorktreeContext,
   getMuxBackend,
   sendEscape,
   shellEscape,
@@ -132,6 +134,12 @@ const SubagentParams = Type.Object({
     Type.String({
       description:
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+    }),
+  ),
+  worktree: Type.Optional(
+    Type.String({
+      description:
+        "Git worktree to run the sub-agent in (herdr only; the project must be a Git repository). Value is a worktree name, e.g. \"hotfix-issue-20\": an existing worktree with that name is reused, otherwise one is created as a sibling directory `<repo-dir>-<name>` on a new branch with that name. The pane/tab opens inside the worktree's herdr workspace and the sub-agent starts in the worktree directory (overrides cwd).",
     }),
   ),
   fork: Type.Optional(
@@ -1466,7 +1474,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; worktree?: HerdrWorktreeContext },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1483,7 +1491,10 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const resolvedPaths = resolveSubagentPaths(params, agentDefs);
+  // A worktree placement pins the sub-agent to the worktree checkout.
+  const effectiveCwd = options?.worktree?.path ?? resolvedPaths.effectiveCwd;
+  const { localAgentDir, effectiveAgentDir } = resolvedPaths;
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1502,7 +1513,12 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name, { mode: resolveMuxMode(agentDefs) });
+  const surface = options?.surface ?? createSurface(params.name, {
+    mode: resolveMuxMode(agentDefs),
+    worktree: options?.worktree
+      ? { workspaceId: options.worktree.workspaceId, rootPane: options.worktree.rootPane }
+      : undefined,
+  });
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -2028,8 +2044,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // Resolve an optional git worktree placement (herdr only, Git repo required).
+        let worktree: HerdrWorktreeContext | undefined;
+        const requestedWorktree = params.worktree?.trim();
+        if (requestedWorktree) {
+          const resolved = resolveWorktreeContext(requestedWorktree, ctx.cwd);
+          if (!resolved.ok) {
+            return {
+              content: [{ type: "text", text: resolved.error }],
+              details: { error: "worktree unavailable", worktree: requestedWorktree },
+            };
+          }
+          worktree = resolved.context;
+        }
+
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        const running = await launchSubagent(params, ctx, { worktree });
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)

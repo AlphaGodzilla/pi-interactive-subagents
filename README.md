@@ -181,6 +181,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| `worktree`             | string  | —              | Run the sub-agent in a Git worktree (herdr only). Value is a worktree name, e.g. `hotfix-issue-20`: an existing worktree with that name is reused, otherwise one is created as a sibling directory `<repo-dir>-<name>` on a new branch with that name. The pane/tab opens inside the worktree's herdr workspace and the sub-agent starts in the worktree checkout (overrides `cwd`). |
 
 ---
 
@@ -313,6 +314,8 @@ You are a specialized agent that does X...
 Controls how the subagent surface opens: `pane` (default) splits a pane; `tab` creates a new tab. Only herdr implements `tab` today — every other backend silently falls back to `pane`.
 
 The tab is created in the **spawning agent's workspace** (herdr `tab create --workspace`), not the workspace the user currently has focused.
+
+With the `worktree` spawn parameter, the surface is instead placed inside the worktree's own herdr workspace: pane mode splits inside that workspace's root pane, tab mode opens the tab there. `herdr worktree list/open/create` are used to reuse an existing worktree or create a missing one (`<repo-dir>-<name>` sibling checkout, branch `name`).
 
 **Nested subagents.** A nested subagent using the default pane mode is split inside its parent's tab — pane splits always target the spawning parent's own pane, never the focused one. A nested subagent that explicitly declares `mux: tab` still gets its own new tab.
 
