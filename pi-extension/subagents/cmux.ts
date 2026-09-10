@@ -801,9 +801,20 @@ export function resolveSurfaceRequest(
   return { mode, parentSurface };
 }
 
-/** Args for `herdr tab create` used by the tab mux mode (pure, unit-testable). */
-export function buildHerdrTabCreateArgs(name: string, cwd: string): string[] {
-  return ["tab", "create", "--label", name, "--cwd", cwd, "--no-focus"];
+/**
+ * Args for `herdr tab create` used by the tab mux mode (pure, unit-testable).
+ *
+ * `--workspace` is passed explicitly whenever the caller env provides one:
+ * without it herdr creates the tab in the *focused* workspace, so a subagent
+ * spawned from workspace A while the user views workspace B would land in B.
+ */
+export function buildHerdrTabCreateArgs(name: string, cwd: string, workspaceId?: string): string[] {
+  const args = ["tab", "create"];
+  if (workspaceId) {
+    args.push("--workspace", workspaceId);
+  }
+  args.push("--label", name, "--cwd", cwd, "--no-focus");
+  return args;
 }
 
 /** Extract the tab's root pane id from `herdr tab create` output (pure, unit-testable). */
@@ -822,9 +833,11 @@ export function parseHerdrTabCreateOutput(output: string): string {
 }
 
 function createHerdrTabSurface(name: string): string {
-  const output = execFileSync("herdr", buildHerdrTabCreateArgs(name, process.cwd()), {
-    encoding: "utf8",
-  }).trim();
+  const output = execFileSync(
+    "herdr",
+    buildHerdrTabCreateArgs(name, process.cwd(), process.env.HERDR_WORKSPACE_ID),
+    { encoding: "utf8" },
+  ).trim();
   const paneId = parseHerdrTabCreateOutput(output);
   // Label the root pane too so orphan-pane discovery (listSubagentPanes) sees it.
   try {

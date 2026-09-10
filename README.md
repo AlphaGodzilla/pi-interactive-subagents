@@ -312,6 +312,8 @@ You are a specialized agent that does X...
 
 Controls how the subagent surface opens: `pane` (default) splits a pane; `tab` creates a new tab. Only herdr implements `tab` today — every other backend silently falls back to `pane`.
 
+The tab is created in the **spawning agent's workspace** (herdr `tab create --workspace`), not the workspace the user currently has focused.
+
 **Nested subagents.** A nested subagent using the default pane mode is split inside its parent's tab — pane splits always target the spawning parent's own pane, never the focused one. A nested subagent that explicitly declares `mux: tab` still gets its own new tab.
 
 Closing follows herdr's own semantics: the tab creator is the subagent whose pane is the tab's root pane. When that subagent exits, its pane is closed and the tab is reaped automatically **only if no other pane remains in it** — panes split inside the tab (user splits or nested subagents) keep the tab alive, and their own exits never close the tab. `subagent_cleanup` reaps dead tab-mode subagents the same way (closing the root pane, which reaps an otherwise-empty tab).
