@@ -2284,15 +2284,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
+        "This is a fire-and-forget ASYNC tool: every subagent runs in the background, the call returns immediately with only an acknowledgement, and watching a run cannot make it finish sooner. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
+        "DO NOT poll or babysit a run — no repeated subagents_status calls, no sleep/wait loops, no tail/watch scripts, no re-reading session or log files, and do not call subagents_list to check on one (it only lists agent templates). All of that is wasted work; the harness handles delivery for you. The ONLY reason to query subagents_status is an explicit user request for the current status of a subagent — then answer from that single snapshot. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
         "The launch acknowledgement shows the subagent's internal id, e.g. `Sub-agent \"Worker\" [id a1b2c3d4] launched` — " +
         "keep that id in mind if you may need to interrupt (subagent_interrupt) or steer (subagent_steer) it later.",
       promptSnippet:
-        "Spawn a background sub-agent in a mux pane (fire-and-forget: results arrive automatically, never poll). " +
+        "Spawn a background sub-agent in a mux pane (async, fire-and-forget: results arrive automatically — never poll the run; query subagents_status only if the user asks). " +
         "Keep the returned id — `Sub-agent \"Name\" [id a1b2c3d4] launched` — to interrupt (subagent_interrupt) or steer (subagent_steer) it later.",
       parameters: SubagentParams,
 
@@ -2705,12 +2705,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "`stalled` means no activity update for ~1 minute — a slow start, a long tool call, or a provider stall all " +
         "look the same. It is not proof of death: never interrupt or clean up an entry over a status line; results " +
         "are delivered automatically when a subagent exits.\n" +
-        "Read-only snapshot for when you actually need to look — not a poll, and not a prerequisite for steering. " +
+        "Read-only snapshot for when you actually need to look (the user asked, or before steering/cleanup) — never " +
+        "call it in a loop to watch a run: subagents are async and results arrive automatically. " +
         "`foreign`/`orphan` entries cannot be interrupted or steered from this session. NOT subagents_list (that " +
         "lists agent templates). Pane liveness needs backend support (herdr `agent_status`); without it such panes " +
         "are reported as `orphan` with a caveat, and orphaned processes are still detected via the process table.",
       promptSnippet:
-        "Read-only snapshot of subagents still present: tracked entries plus `foreign` live panes (another session's agents — do not clean up) and `orphan` panes/processes. Not a poll; not the agent-template list (subagents_list). A `stalled` entry may still be working — never interrupt or clean up over it.",
+        "Read-only snapshot of subagents still present: tracked entries plus `foreign` live panes (another session's agents — do not clean up) and `orphan` panes/processes. NOT the agent-template list (subagents_list). Never call this in a loop to watch a run — subagents are async and results arrive automatically; call it once when the user asks or before steering/cleanup. A `stalled` entry may still be working — never interrupt or clean up over it.",
       parameters: Type.Object({}),
 
       async execute() {
@@ -2842,11 +2843,13 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
         "lands back in that worktree's own workspace (reusing the fresh root pane / opening a tab when already open) " +
         "and runs inside the worktree directory. When that repository has CodeGraph enabled, the worktree's index " +
         "is prepared (`codegraph init`/`sync`) before the session resumes (failures only add a warning). " +
-        "Fire-and-forget: the call returns immediately; when the resumed session finishes, its result arrives " +
-        "automatically as a steer message. Never poll for status. " +
+        "Fire-and-forget async, exactly like the subagent tool: the call returns immediately; when the resumed session " +
+        "finishes, its result arrives automatically as a steer message. Do not poll or babysit it — no repeated " +
+        "subagents_status calls, sleep/wait loops, or file tailing; watching cannot make it finish sooner. Query " +
+        "subagents_status only when the user explicitly asks about its current status. " +
         "The name parameter here is only the terminal tab label — it does NOT select a running subagent.",
       promptSnippet:
-        "Resume a previous sub-agent session (from the `Session:` path in its result) in a new mux pane; fire-and-forget, results arrive automatically.",
+        "Resume a previous sub-agent session (from the `Session:` path in its result) in a new mux pane; async fire-and-forget, results arrive automatically — do not poll its status (only for an explicit user request).",
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(

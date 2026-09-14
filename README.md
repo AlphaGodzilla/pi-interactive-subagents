@@ -155,6 +155,8 @@ cp config.json.example config.json
 
 ## Spawning Subagents
 
+Subagents are **async**: the call returns immediately and the result is delivered to the orchestrator automatically as a steer message when the child finishes. The orchestrator is told not to babysit a run — no repeated `subagents_status` calls, wait loops, or log tailing — and to query `subagents_status` only when the user asks for a status (or before steering/cleanup).
+
 ```typescript
 // Named agent with defaults from agent definition
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
@@ -340,6 +342,7 @@ Worktrees of a repository that uses CodeGraph get their index prepared as part o
 
 ## Inspecting and cleaning up subagents
 
+`subagents_status` is a **read-only, on-demand** snapshot — not a progress poll. Spawned subagents are async and report their result automatically, so calling this in a loop only burns turns (the orchestrator tool descriptions say so explicitly).
 `subagents_status` lists every subagent that still has a pane open or a process alive:
 
 - **tracked** entries from the running registry, with live status, elapsed time, and a `[tab]` marker for tab-mode subagents
