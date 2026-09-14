@@ -70,11 +70,11 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn (only when the user asks to stop/pause it or it is demonstrably stuck — a `stalled` status is not a reason) |
 | `subagent_steer`     | Send a steering message into a running Pi-backed subagent's session                         |
 | `subagents_list`     | List available agent definitions                                                            |
-| `subagents_status`   | List subagents still present: tracked entries plus orphaned processes/panes (async-free query) |
-| `subagent_cleanup`   | Clean up dead/orphaned subagents: stalled entries, a specific id/name, or a specific `surface` |
+| `subagents_status`   | List subagents still present: tracked entries plus `foreign` live panes (another session's agents) and `orphan` panes/processes (async-free query) |
+| `subagent_cleanup`   | Clean up dead/orphaned subagents: stalled entries, a specific id/name, or a specific `surface` (the stalled/id/name paths refuse a pane that still reports a live agent) |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
 | Command                    | Description                          |
@@ -124,10 +124,12 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 - `starting` — launched, but no valid child snapshot has been observed yet
 - `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
 - `waiting` — the child finished a turn and is intentionally open for more input or another stage
-- `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
+- `stalled` — no valid current child snapshot for ≥60s. A heuristic, not proof of death: a slow child start, a long tool call, or a provider stall looks identical — the parent is told never to interrupt or clean up a subagent over a status line alone
 - `running` — fallback for backends without child snapshots (e.g. Claude)
 
-These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+`subagents_status` additionally uses two **presence** kinds for panes this session does not track: `foreign` (a live agent owned by another pi session, e.g. a nested orchestrator's subagent — alive, never clean it up from here) and `orphan` (a labeled pane with no live agent detected). See [Inspecting and cleaning up subagents](#inspecting-and-cleaning-up-subagents).
+
+These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react — a stalled wake states the definition above and that interrupting/cleaning up over it is not allowed (the child may still be working; its result/failure is delivered automatically when it exits). All other status transitions stay in the widget only.
 
 **Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
 
@@ -181,7 +183,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
-| `worktree`             | string  | —              | Run the sub-agent in a Git worktree (herdr only). Value is a worktree name, e.g. `hotfix-issue-20`: an existing worktree with that name is reused, otherwise one is created as a sibling directory `<repo-dir>-<name>` on a new branch with that name. The pane/tab opens inside the worktree's herdr workspace and the sub-agent starts in the worktree checkout (overrides `cwd`). |
+| `worktree`             | string  | —              | Run the sub-agent in a Git worktree (herdr only). Value is a worktree name, e.g. `hotfix-issue-20`: an existing worktree with that name is reused, otherwise one is created as a sibling directory `<repo-dir>-<name>` on a new branch with that name. The pane/tab opens inside the worktree's herdr workspace and the sub-agent starts in the worktree checkout (overrides `cwd`). When the repository has CodeGraph enabled (see [CodeGraph index preparation](#codegraph-index-preparation)), the checkout's index is prepared before the sub-agent starts. |
 
 ---
 
@@ -201,6 +203,8 @@ subagent_interrupt({ name: "Scout" });
 ```
 
 This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
+
+**When to use.** Interrupting cancels work in progress, so use it deliberately: the user asked to stop/pause the subagent, or the subagent is demonstrably stuck (its pane shows an error or repeated failures). A `stalled` status line is **not** a reason — it only means no activity snapshot for ≥60s and the subagent may still be working; wait for the automatic result, or use `subagent_steer` to redirect it instead.
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
@@ -251,7 +255,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
-Surface placement mirrors subagent spawning. The resumed session's recorded working directory (from its session header) is restored with `cd`; when that directory is a **still-existing herdr Git worktree**, the session lands back in the worktree's own workspace (reusing the fresh root pane, or a new tab when the workspace was already open) exactly like the `worktree` spawn parameter, and the workspace is reaped again once the resumed session finishes.
+Surface placement mirrors subagent spawning. The resumed session's recorded working directory (from its session header) is restored with `cd`; when that directory is a **still-existing herdr Git worktree**, the session lands back in the worktree's own workspace (reusing the fresh root pane, or a new tab when the workspace was already open) exactly like the `worktree` spawn parameter, and the workspace is reaped again once the resumed session finishes. When that repository has CodeGraph enabled, the worktree's index is prepared (see [CodeGraph index preparation](#codegraph-index-preparation)) before the session resumes.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
@@ -320,11 +324,17 @@ The tab is created in the **spawning agent's workspace** (herdr `tab create --wo
 
 With the `worktree` spawn parameter, the surface is instead placed inside the worktree's own herdr workspace. A **freshly created** (or freshly opened) worktree workspace is dedicated to the spawn: the subagent runs **directly in its root pane** — the workspace keeps exactly one tab and one pane, both renamed to the subagent (no split, no extra tab). A pre-existing worktree workspace (already open, possibly in use) is not disturbed: pane mode splits beside the root pane, tab mode opens a new tab there. `herdr worktree list/open/create` are used to reuse an existing worktree or create a missing one (`<repo-dir>-<name>` sibling checkout, branch `name`).
 
-The worktree workspace is **closed automatically once its last subagent finishes** (closing the root pane lets herdr recycle the workspace; the git checkout stays on disk for reuse). This applies only when the spawn opened/created the workspace — a worktree workspace the user already had open is left untouched. Nested subagents spawned inside that workspace count as part of it, so the workspace stays open until all of them are done.
+The worktree workspace is **closed automatically once its last subagent finishes** (closing the root pane lets herdr recycle the workspace; the git checkout stays on disk for reuse). This applies only when the spawn opened/created the workspace — a worktree workspace the user already had open is left untouched. Nested subagents inherit the workspace for bookkeeping (their panes stay attributable to it) but never inherit reap rights, and the reap is skipped whenever
+(a) the workspace root pane is the very pane the reaping process runs in, or
+(b) any pane in that workspace still reports a live agent to herdr (e.g. a nested subagent that outlived the parent that opened the workspace). In both cases the workspace is left open instead of killing a running agent.
 
 **Nested subagents.** A nested subagent using the default pane mode is split inside its parent's tab — pane splits always target the spawning parent's own pane, never the focused one. A nested subagent that explicitly declares `mux: tab` still gets its own new tab.
 
 Closing follows herdr's own semantics: the tab creator is the subagent whose pane is the tab's root pane. When that subagent exits, its pane is closed and the tab is reaped automatically **only if no other pane remains in it** — panes split inside the tab (user splits or nested subagents) keep the tab alive, and their own exits never close the tab. `subagent_cleanup` reaps dead tab-mode subagents the same way (closing the root pane, which reaps an otherwise-empty tab).
+
+#### CodeGraph index preparation
+
+Worktrees of a repository that uses CodeGraph get their index prepared as part of the spawn, before the sub-agent starts. A repository counts as codegraph-enabled when its **main checkout** carries a `.codegraph` directory (the index lives outside git, so freshly created worktrees never inherit it) and the `codegraph` CLI is on `PATH` (`codegraph` is *not* installed by this extension). A checkout without an index — every freshly created worktree, and older worktrees from before codegraph was enabled — runs `codegraph init --yes <checkout>`; one that already has a `.codegraph` index runs `codegraph sync <checkout>`. The step is blocking (the spawn waits for the command) but best-effort: a failure or timeout never blocks the spawn, it only adds a warning to the spawn result. `subagent_resume` returning a session to its worktree prepares the index the same way.
 
 ---
 
@@ -334,15 +344,18 @@ Closing follows herdr's own semantics: the tab creator is the subagent whose pan
 
 - **tracked** entries from the running registry, with live status, elapsed time, and a `[tab]` marker for tab-mode subagents
 - **orphan processes**: pi subagents still running whose running entry was lost (e.g. after a session restart), discovered from the process table and filtered to this session's directory
-- **orphan panes**: named panes left behind by failed launches that no running entry tracks
+- **`foreign`** labeled panes that report a **live** agent this session does not track. This is the nested-orchestrator case: a subagent spawned by another pi session (or another window) is invisible to this session's registry, but herdr reports the pane's agent state, so it is listed as `foreign` (with its `agent_status` and owning session) instead of being mistaken for a dead pane. It is **alive** — never clean it up from here; steer/interrupt it from the session that spawned it.
+- **`orphan`** labeled panes with **no live agent detected** (left behind by failed launches, crashes, or restarts). Note that closing an orphan pane still destroys whatever else may run inside it.
+
+Pane-liveness reporting comes from herdr's `agent_status`; backends without agent metadata (zellij) — and panes whose agent herdr does not track at all (e.g. a Claude-backed subagent) — list their labeled panes as `orphan` with that caveat, so treat an `orphan` entry as "nothing live was detected", not as proof that the pane is dead. Tracked entries are unaffected: a healthy child that is idle — or that is itself waiting on its own subagents — stays `waiting`, and `stalled` is reserved for a tracked child whose activity snapshot went missing for ≥60s.
 
 `subagent_cleanup` removes them:
 
 | Call | Effect |
 | --- | --- |
-| `subagent_cleanup()` | Clean every entry currently classified as `stalled` (active/waiting subagents are untouched) |
-| `subagent_cleanup({ id })` / `subagent_cleanup({ name })` | Force-clean that one subagent regardless of status (pane closed, pending result abandoned) |
-| `subagent_cleanup({ surface })` | Close a specific mux surface directly — use for orphan panes/tabs reported by `subagents_status`; closing a tab's root pane reaps the tab when it holds no other panes |
+| `subagent_cleanup()` | Clean every entry currently classified as `stalled` (active/waiting subagents and panes that still report a live agent are untouched) |
+| `subagent_cleanup({ id })` / `subagent_cleanup({ name })` | Force-clean that one subagent regardless of status (pane closed, pending result abandoned) — **refused** while its pane reports a live agent |
+| `subagent_cleanup({ surface })` | Close a specific mux surface directly — use for `orphan` panes/tabs reported by `subagents_status`; closing a tab's root pane reaps the tab when it holds no other panes. **Refuses** an *untracked* surface whose pane reports a live agent (`foreign` panes owned by another pi session): that call returns a refusal instead of killing the agent mid-work. A tracked entry's surface closes regardless — that is the deliberate escape hatch |
 
 ### Poll diagnostics (debugging)
 

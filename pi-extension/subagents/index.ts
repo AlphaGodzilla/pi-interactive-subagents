@@ -32,6 +32,10 @@ import {
   sendEscape,
   shellEscape,
   readScreen,
+  isLiveAgentStatus,
+  listLiveAgentPaneSurfaces,
+  findPaneInfo,
+  type MuxPaneInfo,
 } from "./cmux.ts";
 
 import {
@@ -48,7 +52,7 @@ import {
   classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
-  formatStatusAggregate,
+  formatStatusWake,
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
@@ -142,7 +146,7 @@ const SubagentParams = Type.Object({
   worktree: Type.Optional(
     Type.String({
       description:
-        "Git worktree to run the sub-agent in (herdr only; the project must be a Git repository). Value is a worktree name, e.g. \"hotfix-issue-20\": an existing worktree with that name is reused, otherwise one is created as a sibling directory `<repo-dir>-<name>` on a new branch with that name. The pane/tab opens inside the worktree's herdr workspace and the sub-agent starts in the worktree directory (overrides cwd).",
+        "Git worktree to run the sub-agent in (herdr only; the project must be a Git repository). Value is a worktree name, e.g. \"hotfix-issue-20\": an existing worktree with that name is reused, otherwise one is created as a sibling directory `<repo-dir>-<name>` on a new branch with that name. The pane/tab opens inside the worktree's herdr workspace and the sub-agent starts in the worktree directory (overrides cwd). When the repository has CodeGraph enabled (`.codegraph` in the main checkout and the `codegraph` CLI on PATH), the checkout's index is prepared first — `codegraph init` for a fresh checkout, `codegraph sync` when it already has an index; a preparation failure only adds a warning.",
     }),
   ),
   fork: Type.Optional(
@@ -556,6 +560,22 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
   const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
   return ` stalled${detail}${duration} `;
+}
+
+/**
+ * Fallback summary for a subagent that produced no assistant text. A
+ * surface-gone exit carries a synthetic non-zero code (the child was killed
+ * from outside and never reported a status), so it must not be presented as a
+ * real exit code.
+ */
+function formatSubagentExitFallback(
+  reason: "done" | "ping" | "sentinel" | "error" | "surface-gone" | undefined,
+  exitCode: number,
+): string {
+  if (reason === "surface-gone") {
+    return "Sub-agent pane was closed externally before it finished (exit status unknown)";
+  }
+  return exitCode !== 0 ? `Sub-agent exited with code ${exitCode}` : "Sub-agent exited without output";
 }
 
 function resolveResultPresentation(
@@ -1085,15 +1105,40 @@ function handleSubagentSteer(
  * a workspace the user already had open is left running. Closing the root pane
  * makes herdr recycle the workspace itself; the git worktree checkout stays on
  * disk and is reused by the next spawn.
+ *
+ * Two hard guards keep the reap from killing live agents:
+ * - Never close the pane this process itself runs in. A nested orchestrator
+ *   inherits the enclosing worktree metadata; reaping that workspace would
+ *   close the very pane it lives in and kill it mid-turn.
+ * - Never recycle a workspace that still hosts a live agent pane (e.g. a
+ *   nested subagent that outlived the parent that opened the workspace).
+ *   Closing the root pane recycles the whole workspace, so when liveness
+ *   cannot be verified the workspace is left open instead. Skipping the reap
+ *   does not leak workspaces in the normal case: once the last pane in it is
+ *   closed (the watcher closes the finished subagent's own pane first), herdr
+ *   recycles the workspace by itself.
  */
 function maybeReapWorktreeWorkspace(
   worktree: RunningSubagent["worktree"],
   closeSurfaceFn: (surface: string) => void = closeSurface,
+  livePaneSurfacesFn: () => string[] | null = listLiveAgentPaneSurfaces,
 ): void {
   if (!worktree || !worktree.reap || !worktree.rootPane) return;
+  const self = currentSurfaceId();
+  if (self !== null && worktree.rootPane === self) return;
   for (const running of runningSubagents.values()) {
     if (running.worktree?.workspaceId === worktree.workspaceId) return;
   }
+  let livePaneSurfaces: string[] | null = null;
+  try {
+    livePaneSurfaces = livePaneSurfacesFn();
+  } catch {
+    livePaneSurfaces = null;
+  }
+  // Unverifiable liveness: refusing to reap only leaves a workspace open,
+  // while reaping blindly can kill another session's running agent.
+  if (livePaneSurfaces === null) return;
+  if (livePaneSurfaces.some((surface) => surfaceWorkspaceId(surface) === worktree.workspaceId)) return;
   try {
     closeSurfaceFn(worktree.rootPane);
   } catch {
@@ -1104,6 +1149,7 @@ function maybeReapWorktreeWorkspace(
 function handleSubagentCleanup(
   params: { id?: string; name?: string; surface?: string },
   closeSurfaceFn: (surface: string) => void = closeSurface,
+  deps: { findPaneFn?: (surface: string) => MuxPaneInfo | null } = {},
 ) {
   const now = Date.now();
   const targets: RunningSubagent[] = [];
@@ -1117,6 +1163,41 @@ function handleSubagentCleanup(
   // tab's root pane reaps the tab itself when it holds no other panes.
   if (requestedSurface) {
     const tracked = Array.from(runningSubagents.values()).find((r) => r.surface === requestedSurface);
+
+    // Never close a pane that is running another pi session's live agent.
+    // A labeled pane this session does not track may belong to a nested
+    // orchestrator (its own subagent) or another window; herdr reports the
+    // pane's agent state, and only a pane with no live agent may be closed.
+    if (!tracked) {
+      const findPaneFn = deps.findPaneFn ?? findPaneInfo;
+      let pane: MuxPaneInfo | null = null;
+      try {
+        pane = findPaneFn(requestedSurface);
+      } catch {
+        pane = null;
+      }
+      if (pane && isLiveAgentStatus(pane.agentStatus)) {
+        const owner = pane.agentSession ? ` (session: ${pane.agentSession})` : "";
+        const kind = pane.agentKind ? `${pane.agentKind} ` : "";
+        const message =
+          `Refused to close surface ${requestedSurface}: a live ${kind}agent is running in that pane ` +
+          `(status: ${pane.agentStatus}). It belongs to another pi session${owner}, not to this one, and ` +
+          `closing the pane would kill it mid-work. Steer or interrupt it from the session that spawned it, ` +
+          `or close the pane manually if you know the agent is gone.`;
+        return {
+          content: [{ type: "text" as const, text: message }],
+          details: {
+            error: message,
+            surface: requestedSurface,
+            refused: true,
+            reason: "live-agent",
+            agentStatus: pane.agentStatus,
+            agentKind: pane.agentKind,
+            agentSession: pane.agentSession,
+          },
+        };
+      }
+    }
     try {
       closeSurfaceFn(requestedSurface);
     } catch (error: any) {
@@ -1174,7 +1255,41 @@ function handleSubagentCleanup(
     };
   }
 
-  const cleaned = targets.map((running) => {
+  // A `stalled` classification (or an explicit id/name force-clean) is a
+  // heuristic, not proof of death: never close a pane the multiplexer still
+  // reports a live agent in — the child may be slow to start or busy in a long
+  // tool call. Refused entries stay tracked and are reported back.
+  const findPaneFn = deps.findPaneFn ?? findPaneInfo;
+  const refused: Array<{ id: string; name: string; surface: string; agentStatus: string | null }> = [];
+  const cleanable: RunningSubagent[] = [];
+  for (const running of targets) {
+    let pane: MuxPaneInfo | null = null;
+    try {
+      pane = findPaneFn(running.surface);
+    } catch {
+      pane = null;
+    }
+    if (pane && isLiveAgentStatus(pane.agentStatus)) {
+      refused.push({ id: running.id, name: running.name, surface: running.surface, agentStatus: pane.agentStatus });
+    } else {
+      cleanable.push(running);
+    }
+  }
+
+  if (cleanable.length === 0) {
+    const names = refused.map((r) => `"${r.name}" [${r.id}] (${r.agentStatus ?? "live"})`).join(", ");
+    const message =
+      `Refused to clean up ${refused.length} subagent${refused.length > 1 ? "s" : ""}: ${names}. ` +
+      "The pane still reports a live agent — a `stalled` entry can still be working (slow start, long tool call), " +
+      "and closing its pane would kill it mid-work; its result (or failure) is delivered automatically. " +
+      "Use subagent_interrupt to cancel its turn, or pass this surface explicitly if you know the agent is gone.";
+    return {
+      content: [{ type: "text" as const, text: message }],
+      details: { cleaned: [], refused, refusedCount: refused.length, status: "refused" },
+    };
+  }
+
+  const cleaned = cleanable.map((running) => {
     // Abort the watcher so its poll loop unwinds via the cancelled path
     // (it also closes the surface as best effort); the surface close below is
     // idempotent. The watcher's completion then reports "cancelled" to the
@@ -1203,16 +1318,26 @@ function handleSubagentCleanup(
 
   const label = cleaned.map((c) => `"${c.name}" [${c.id}]`).join(", ");
   const forced = requestedId || requestedName ? "forced " : "stalled ";
+  const refusalNote =
+    refused.length > 0
+      ? ` Refused ${refused.length} pane${refused.length > 1 ? "s" : ""} that still report${refused.length > 1 ? "" : "s"} a live agent: ${refused
+          .map((r) => `"${r.name}" [${r.id}] (${r.agentStatus ?? "live"})`)
+          .join(", ")} — a stalled entry can still be working; use subagent_interrupt to cancel its turn.`
+      : "";
   return {
     content: [
       {
         type: "text" as const,
         text:
           `Cleaned up ${cleaned.length} ${forced}subagent${cleaned.length > 1 ? "s" : ""}: ${label}. ` +
-          "Panes closed and running entries removed.",
+          "Panes closed and running entries removed." +
+          refusalNote,
       },
     ],
-    details: { cleaned, count: cleaned.length, status: "cleaned" },
+    details:
+      refused.length > 0
+        ? { cleaned, count: cleaned.length, status: "cleaned", refused, refusedCount: refused.length }
+        : { cleaned, count: cleaned.length, status: "cleaned" },
   };
 }
 
@@ -1287,6 +1412,28 @@ function currentSessionDir(): string | null {
   }
 }
 
+/** Session file of the session this process is running, when known. */
+function currentSessionFileOrNull(): string | null {
+  try {
+    const file = latestCtx?.sessionManager?.getSessionFile();
+    return typeof file === "string" && file !== "" ? file : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Pane id this process itself runs in, when the mux reports one. */
+function currentSurfaceId(): string | null {
+  const surface = process.env.PI_SUBAGENT_SURFACE ?? process.env.HERDR_PANE_ID ?? "";
+  return surface !== "" ? surface : null;
+}
+
+/** Workspace part of a mux surface id ("w1R:p2" → "w1R"); null when unqualified. */
+function surfaceWorkspaceId(surface: string): string | null {
+  const index = surface.indexOf(":");
+  return index > 0 ? surface.slice(0, index) : null;
+}
+
 /**
  * List every subagent that still has a pane open or a process alive,
  * independent of state: live registry entries, orphaned pi processes, and
@@ -1297,12 +1444,21 @@ function currentSessionDir(): string | null {
 function handleSubagentsStatus(
   deps: {
     listAllSurfacesFn?: () => string[];
-    listNamedPanesFn?: () => Array<{ surface: string; label: string }>;
+    listNamedPanesFn?: () => Array<{
+      surface: string;
+      label: string | null;
+      agentStatus?: string | null;
+      agentKind?: string | null;
+      agentSession?: string | null;
+    }>;
+    currentSessionFileFn?: () => string | null;
     discoverOrphansFn?: (trackedIds: ReadonlySet<string>, sessionDir: string | null) => OrphanProcess[];
   } = {},
 ) {
   const listAll = deps.listAllSurfacesFn ?? listAllSurfaces;
   const listNamed = deps.listNamedPanesFn ?? listSubagentPanes;
+  // Deps follow the *Fn convention: call the injected getter, else the default.
+  const currentSessionFile = (deps.currentSessionFileFn ?? currentSessionFileOrNull)();
   const discover = deps.discoverOrphansFn ?? discoverOrphanSubagentProcesses;
   const now = Date.now();
   const trackedIds = new Set(runningSubagents.keys());
@@ -1354,19 +1510,32 @@ function handleSubagentsStatus(
   for (const pane of namedPanes) {
     const tracked = Array.from(runningSubagents.values()).some((r) => r.surface === pane.surface);
     if (tracked) continue;
+    // A labeled pane this session does not track is NOT necessarily dead: it
+    // may be running another pi session's live agent (a nested orchestrator's
+    // subagent, another window). herdr reports the pane's agent state, so the
+    // entry distinguishes `foreign` (alive — never clean up from here) from
+    // `orphan` (no live agent detected).
+    const agentStatus = pane.agentStatus ?? null;
+    const agentSession = pane.agentSession ?? null;
+    const live = isLiveAgentStatus(agentStatus);
     entries.push({
       id: null,
-      name: pane.label,
+      name: pane.label ?? pane.surface,
       surface: pane.surface,
-      origin: "orphan-pane" as const,
+      origin: live ? ("live-pane" as const) : ("orphan-pane" as const),
       paneOpen: true,
       agent: null,
       task: null,
-      cli: "unknown",
+      cli: live ? (pane.agentKind ?? "unknown") : "unknown",
       interactive: false,
-      kind: "orphan",
+      kind: live ? "foreign" : "orphan",
+      agentKind: pane.agentKind ?? null,
+      agentStatus,
+      agentSession,
+      ownedByThisSession:
+        agentSession !== null && currentSessionFile !== null ? agentSession === currentSessionFile : null,
       statusLabel: null,
-      activityLabel: null,
+      activityLabel: live ? agentStatus : null,
       elapsedMs: null,
     });
   }
@@ -1383,8 +1552,18 @@ function handleSubagentsStatus(
       const pane = e.surface ? `, pane ${e.surface}` : "";
       return `• ${e.name} [orphan ${e.id}] — pi process alive (pid ${e.pid})${pane}, no running entry (restart the session to track it, or kill the process)`;
     }
+    if (e.origin === "live-pane") {
+      const status = e.agentStatus ? ` (${e.agentStatus})` : "";
+      const agentName = e.agentKind ? `${e.agentKind} ` : "";
+      const owner = e.ownedByThisSession === true
+        ? "this session"
+        : e.agentSession
+          ? `another pi session: ${e.agentSession}`
+          : "another pi session";
+      return `• ${e.name} [live pane ${e.surface}] — live ${agentName}agent${status} owned by ${owner}; not tracked here (steer/interrupt it from the session that spawned it)`;
+    }
     if (e.origin === "orphan-pane") {
-      return `• ${e.name} [orphan pane ${e.surface}] — pane open, no running entry (cannot interrupt/steer; clean up with subagent_cleanup({surface: "${e.surface}"}))`;
+      return `• ${e.name} [orphan pane ${e.surface}] — no live pi agent detected; the pane may still run another process, so closing it is destructive (subagent_cleanup({surface: "${e.surface}"}) only when you are sure)`;
     }
     const detail = [e.kind, e.activityLabel ?? e.statusLabel].filter(Boolean).join(" · ");
     const elapsed = Math.floor((e.elapsedMs ?? 0) / 1000);
@@ -1399,12 +1578,18 @@ function handleSubagentsStatus(
   });
 
   const orphanCount = entries.filter((e: any) => (e.origin as string).startsWith("orphan")).length;
+  const foreignCount = entries.filter((e: any) => e.kind === "foreign").length;
+  const countSummary = [
+    `${entries.filter((e: any) => e.origin === "registry").length} tracked`,
+    `${orphanCount} orphan`,
+    ...(foreignCount > 0 ? [`${foreignCount} live elsewhere`] : []),
+  ].join(", ");
 
   return {
     content: [
       {
         type: "text" as const,
-        text: `${entries.length} subagent${entries.length > 1 ? "s" : ""} (${entries.filter((e: any) => e.origin === "registry").length} tracked, ${orphanCount} orphan):\n${lines.join("\n")}`,
+        text: `${entries.length} subagent${entries.length > 1 ? "s" : ""} (${countSummary}):\n${lines.join("\n")}`,
       },
     ],
     details: { count: entries.length, entries },
@@ -1425,6 +1610,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     }
 
     const transitionLines: string[] = [];
+    let stalledTransition = false;
     const now = Date.now();
     let shouldRefreshWidget = false;
 
@@ -1441,6 +1627,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // working in the subagent's pane, and a steer message here would burn an
       // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
       if (transition && !running.interactive) {
+        if (transition === "stalled") stalledTransition = true;
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
     }
@@ -1452,9 +1639,9 @@ function startStatusRefresh(pi: ExtensionAPI) {
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          content: formatStatusWake(transitionLines, statusConfig.lineLimit, stalledTransition),
           display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
+          details: { lines: capped.visibleLines, overflow: capped.overflow, stalled: stalledTransition },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -1492,6 +1679,9 @@ export const __test__ = {
   handleSubagentCleanup,
   handleSubagentsStatus,
   maybeReapWorktreeWorkspace,
+  surfaceWorkspaceId,
+  currentSurfaceId,
+  formatSubagentExitFallback,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   resolveParentModel,
@@ -1558,9 +1748,12 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  // A direct `worktree` param places this spawn; nested subagents inherit the
-  // enclosing worktree workspace through the env injected below, so they also
-  // count toward "all tasks finished" for that workspace.
+  // A direct `worktree` param places this spawn. Nested subagents inherit the
+  // enclosing worktree workspace through the env injected below so their panes
+  // stay attributable to it, but they do NOT inherit reap rights: only the
+  // process that opened the workspace may recycle it (an intermediate
+  // orchestrator that reaped an inherited workspace would close the very pane
+  // it is running in).
   const inheritedWorktreeWorkspace = process.env.PI_SUBAGENT_WORKTREE_WORKSPACE;
   const effectiveWorktree: { workspaceId: string; rootPane: string; reap: boolean } | undefined =
     options?.worktree
@@ -1573,7 +1766,8 @@ async function launchSubagent(
         ? {
             workspaceId: inheritedWorktreeWorkspace,
             rootPane: process.env.PI_SUBAGENT_WORKTREE_ROOT_PANE ?? "",
-            reap: process.env.PI_SUBAGENT_WORKTREE_REAP === "1",
+            // Nested spawns never reap: the workspace opener owns reaping.
+            reap: false,
           }
         : undefined;
 
@@ -1952,21 +2146,12 @@ async function watchSubagent(
 
     // Pi subagent result extraction
     let summary: string;
+    const exitFallback = formatSubagentExitFallback(result.reason, result.exitCode);
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
-      summary =
-        findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+      summary = findLastAssistantMessage(allEntries) ?? (result.errorMessage ? `Subagent error: ${result.errorMessage}` : exitFallback);
     } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+      summary = result.errorMessage ? `Subagent error: ${result.errorMessage}` : exitFallback;
     }
 
     // Failed launches often die before writing anything to the session file
@@ -1984,11 +2169,12 @@ async function watchSubagent(
       }
     }
 
-    // The pane was closed externally (user closed it, or its workspace was
-    // reaped); the child never signalled completion.
+    // The pane was closed externally (a user, another pi session's cleanup, or
+    // a recycled workspace); the child never signalled completion and no real
+    // exit status exists.
     const surfaceGone = result.reason === "surface-gone";
     if (surfaceGone && result.exitCode !== 0 && !result.errorMessage) {
-      summary = `${summary}\n\n(Pane was closed externally before the sub-agent finished.)`;
+      summary = `${summary}\n\n(Pane was closed externally before the sub-agent finished — a user or another pi session/agent may have closed it; no child exit status was observed.)`;
     }
 
     try {
@@ -2153,7 +2339,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               ? params.cwd
               : join(process.cwd(), params.cwd)
             : ctx.cwd;
-          const resolved = resolveWorktreeContext(requestedWorktree, worktreeBaseDir);
+          const resolved = await resolveWorktreeContext(requestedWorktree, worktreeBaseDir, {
+            onCodegraphPrepare: (action, worktreePath) =>
+              ctx.ui.notify(`Preparing CodeGraph index (codegraph ${action}) in ${worktreePath}…`, "info"),
+          });
           if (!resolved.ok) {
             return {
               content: [{ type: "text", text: resolved.error }],
@@ -2234,6 +2423,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           });
 
+        const codegraphWarning = worktree?.codegraph?.warning;
         // Return immediately
         return {
           content: [
@@ -2243,7 +2433,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `Sub-agent "${params.name}" [id ${running.id}] launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `Until then, move on to other work or tell the user you're waiting.` +
+                (codegraphWarning ? `\n\nWarning: ${codegraphWarning}` : ""),
             },
           ],
           details: {
@@ -2253,6 +2444,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             agent: params.agent,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
+            ...(worktree?.codegraph && worktree.codegraph.action !== "skip"
+              ? { codegraph: worktree.codegraph }
+              : {}),
             status: "started",
           },
         };
@@ -2322,16 +2516,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Send Escape to the active turn of a currently running Pi-backed subagent, cancelling its in-flight model turn " +
         "(including the current tool execution). Turn-level only: the child pane, session, watcher and running entry " +
-        "remain alive; after the interrupt the child sits in `waiting` and its completion/failure still arrives later as usual.\n" +
+        "remain alive; after the interrupt the child sits in `waiting` and still reports its result/failure if it later exits.\n" +
         "\nHOW TO TARGET THE SUBAGENT:\n" +
         "- id (preferred): the 8-hex id from the spawn result, e.g. `Sub-agent \"x\" [id a1b2c3d4] launched`. Unique and unambiguous.\n" +
         "- name (fallback): the exact display name used at spawn, when the id is unknown. Names are not guaranteed " +
         "  unique; an ambiguous name is rejected with the list of candidates.\n" +
-        "- Never put a display name into the id parameter — id accepts only the 8-hex internal id.",
+        "- Never put a display name into the id parameter — id accepts only the 8-hex internal id.\n" +
+        "\nWHEN TO INTERRUPT:\n" +
+        "- The user asked to stop or pause it, or it is demonstrably stuck (its pane shows an error or repeated " +
+        "  failures). A `stalled` status line is NOT a reason: it only means no activity update for ~1 minute, and " +
+        "  the subagent may still be working.\n" +
+        "- The interrupt cancels the turn in flight — in-progress work can be lost; prefer subagent_steer to redirect " +
+        "  it when cancelling is not necessary.",
       promptSnippet:
-        "Interrupt the active turn of a running subagent. Target it by the [id ...] from its spawn result (preferred) or by its display name in name — never pass the display name as id.",
+        "Interrupt the active turn of a running subagent — only when the user asked to stop/pause it or you verified it is stuck (a `stalled` status line alone is not a reason). Target it by the [id ...] from its spawn result (preferred) or by its display name in name — never pass the display name as id.",
       promptGuidelines: [
         "Use subagent_interrupt to cancel a running subagent's current turn: pass the 8-hex id from its spawn result (the `[id a1b2c3d4]` in `Sub-agent ... launched`) in the id parameter; if you only remember the display name, pass it in the name parameter — never in id.",
+        "Interrupt a subagent only when the user asked to stop/pause/cancel it or you verified it is stuck — a `stalled` status is NOT a reason (it only means no activity update for ~1 min and the subagent may still be working). Interrupting cancels its in-flight turn and can lose work; prefer subagent_steer to redirect.",
       ],
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Internal id (8-hex, shown in the spawn result as [id ...]). If unknown, put the display name in the name field instead." })),
@@ -2437,18 +2638,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Clean up dead/orphaned subagent entries: closes their panes and removes them from the running registry. " +
         "Use when a subagent never made it into pi (only an empty pane was left behind) or died in a way the watcher " +
-        "did not detect, leaving a permanent `stalled` entry in the widget that interrupt/steer cannot reach.\n" +
+        "did not detect, leaving a `stalled` entry in the widget.\n" +
+        "`stalled` is a heuristic — a slow start or a long tool call looks the same — so cleanup is for leftovers, " +
+        "never a reaction to a status line.\n" +
         "\nTARGETING:\n" +
-        "- No id/name: clean every entry currently classified as `stalled` (safe default; active/waiting subagents are untouched).\n" +
-        "- id or name (optional): force-clean that one subagent regardless of its status — its pane is closed and any " +
-        "  pending result is abandoned. Targeting rules are the same as subagent_interrupt (8-hex id preferred, " +
-        "  display name via the name field).\n" +
-        "- surface (optional): close a specific mux surface directly. Use this for orphaned panes/tabs that have no " +
-        "  running entry (e.g. dead tab-mode subagents reported by subagents_status as orphan panes); closing a tab's " +
-        "  root pane reaps the tab when it holds no other panes.\n" +
+        "- No id/name: every entry currently classified as `stalled` (active/waiting entries and live-agent panes are " +
+        "  untouched).\n" +
+        "- id or name: force that one entry regardless of status — its pane is closed and any pending result is " +
+        "  abandoned; refused when its pane reports a live agent. Same targeting as subagent_interrupt.\n" +
+        "- surface: close that mux surface directly (orphaned panes/tabs with no running entry; a tab reaps when its " +
+        "  root pane closes). An untracked surface is refused when its pane reports a LIVE agent (`foreign`, e.g. a " +
+        "  nested orchestrator's subagent); a tracked entry closes regardless, so use this deliberately.\n" +
         "The cleaned subagent's watcher reports `cancelled` to you as the acknowledgement.",
       promptSnippet:
-        "Clean up dead subagents: no args removes all `stalled` entries (closing their panes); pass id/name to force-remove one entry regardless of status.",
+        "Clean up dead/leftover subagents: no args = `stalled` entries, id/name = force one, surface = close a pane directly. For leftovers only — never a reaction to a `stalled` status line; to cancel a running subagent's turn use subagent_interrupt instead.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Internal id (8-hex) of the subagent to force-clean; omit to clean all stalled entries" })),
         name: Type.Optional(Type.String({ description: "Display name of the subagent to force-clean (when the id is unknown)" })),
@@ -2494,17 +2697,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_status",
       label: "Subagent Status",
       description:
-        "List every subagent that still has a pane open or a process alive: tracked running entries (id, name, live " +
+        "List every subagent that still has a pane open or a process alive: tracked running entries (id, name, " +
         "status kind starting/active/waiting/stalled, elapsed, task), orphaned pi processes that lost their running " +
-        "entry (e.g. after an orchestrator restart), and orphaned named panes left behind by failed launches. " +
-        "\nUse it to see the full picture before targeting subagent_interrupt / subagent_steer / subagent_cleanup, or " +
-        "to spot panes that linger after a restart. Orphan entries cannot be interrupted or steered (no running " +
-        "entry); they can only be closed manually or reaped by restarting the session. " +
-        "NOT the same as subagents_list, which lists the available agent templates. " +
-        "Orphaned-pane discovery depends on backend naming support (herdr labels, zellij pane names); on other " +
-        "backends orphaned processes are still detected via the process table.",
+        "entry (e.g. after an orchestrator restart), labeled panes that report a live agent this session does not " +
+        "track (`foreign` — another pi session's agent, e.g. a nested orchestrator's subagent; NEVER clean these up " +
+        "from here), and labeled panes with no live agent detected (`orphan`, left behind by failed launches).\n" +
+        "`stalled` means no activity update for ~1 minute — a slow start, a long tool call, or a provider stall all " +
+        "look the same. It is not proof of death: never interrupt or clean up an entry over a status line; results " +
+        "are delivered automatically when a subagent exits.\n" +
+        "Read-only snapshot for when you actually need to look — not a poll, and not a prerequisite for steering. " +
+        "`foreign`/`orphan` entries cannot be interrupted or steered from this session. NOT subagents_list (that " +
+        "lists agent templates). Pane liveness needs backend support (herdr `agent_status`); without it such panes " +
+        "are reported as `orphan` with a caveat, and orphaned processes are still detected via the process table.",
       promptSnippet:
-        "List all subagents still present: tracked entries plus orphaned processes/panes (id, name, status) — pick targets for interrupt/steer/cleanup; NOT the agent-template list (subagents_list).",
+        "Read-only snapshot of subagents still present: tracked entries plus `foreign` live panes (another session's agents — do not clean up) and `orphan` panes/processes. Not a poll; not the agent-template list (subagents_list). A `stalled` entry may still be working — never interrupt or clean up over it.",
       parameters: Type.Object({}),
 
       async execute() {
@@ -2634,7 +2840,8 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
         "Surface placement mirrors subagent spawning: `mux: \"pane\"` (default) splits a pane; `mux: \"tab\"` opens a tab. " +
         "When the session's recorded working directory is a herdr Git worktree that still exists, the resumed session " +
         "lands back in that worktree's own workspace (reusing the fresh root pane / opening a tab when already open) " +
-        "and runs inside the worktree directory. " +
+        "and runs inside the worktree directory. When that repository has CodeGraph enabled, the worktree's index " +
+        "is prepared (`codegraph init`/`sync`) before the session resumes (failures only add a warning). " +
         "Fire-and-forget: the call returns immediately; when the resumed session finishes, its result arrives " +
         "automatically as a steer message. Never poll for status. " +
         "The name parameter here is only the terminal tab label — it does NOT select a running subagent.",
@@ -2724,7 +2931,10 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
         const sessionCwdUsable = sessionCwd !== undefined && existsSync(sessionCwd);
         let resumeWorktree: HerdrWorktreeContext | undefined;
         if (sessionCwdUsable) {
-          const found = findWorktreeContextByPath(sessionCwd);
+          const found = await findWorktreeContextByPath(sessionCwd, {
+            onCodegraphPrepare: (action, worktreePath) =>
+              ctx.ui.notify(`Preparing CodeGraph index (codegraph ${action}) in ${worktreePath}…`, "info"),
+          });
           if (found.ok) resumeWorktree = found.context;
         }
         const effectiveCwd = resumeWorktree?.path ?? (sessionCwdUsable ? sessionCwd : undefined);
@@ -2921,13 +3131,24 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
             );
           });
 
+        const resumeCodegraphWarning = resumeWorktree?.codegraph?.warning;
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          content: [
+            {
+              type: "text",
+              text:
+                `Session "${name}" resumed.` +
+                (resumeCodegraphWarning ? `\n\nWarning: ${resumeCodegraphWarning}` : ""),
+            },
+          ],
           details: {
             id,
             name,
             sessionPath: params.sessionPath,
             launchScriptFile,
+            ...(resumeWorktree?.codegraph && resumeWorktree.codegraph.action !== "skip"
+              ? { codegraph: resumeWorktree.codegraph }
+              : {}),
             status: "started",
           },
         };

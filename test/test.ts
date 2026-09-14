@@ -39,7 +39,15 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  parseHerdrPaneList,
+  isLiveAgentStatus,
 } from "../pi-extension/subagents/cmux.ts";
+import {
+  CODEGRAPH_COMMAND_TIMEOUT_MS,
+  commandOnPath,
+  planCodegraphPreparation,
+  prepareCodegraphForWorktree,
+} from "../pi-extension/subagents/codegraph.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -48,6 +56,7 @@ import {
   forceStatusAfterInterrupt,
   formatStatusAggregate,
   formatStatusLine,
+  formatStatusWake,
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
@@ -90,6 +99,16 @@ function withTempDir(run: (dir: string) => void) {
   const dir = createTestDir();
   try {
     run(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** `withTempDir` for async test bodies: the directory is removed after the promise settles. */
+async function withTempDirAsync(run: (dir: string) => Promise<void>) {
+  const dir = createTestDir();
+  try {
+    await run(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -866,6 +885,18 @@ describe("status.ts", () => {
     assert.doesNotMatch(recovered, /\n/);
     assert.ok(line.length <= 120, `expected bounded line length, got ${line.length}`);
     assert.ok(recovered.length <= 120, `expected bounded line length, got ${recovered.length}`);
+  });
+
+  it("appends stall guidance to a stalled wake and keeps recovered wakes clean", () => {
+    const wake = formatStatusWake(["Worker running 16m, stalled 1m."], 4, true);
+    assert.match(wake, /^Subagent status:/);
+    assert.match(wake, /Worker running 16m, stalled 1m\./);
+    assert.match(wake, /not proof the subagent died/);
+    assert.match(wake, /do not interrupt or clean it up/);
+
+    const recovered = formatStatusWake(["Worker running 17m, recovered; active (bash 1s)."], 4, false);
+    assert.equal(recovered, formatStatusAggregate(["Worker running 17m, recovered; active (bash 1s)."], 4));
+    assert.doesNotMatch(recovered, /Note:/);
   });
 
   it("caps visible status lines and reports overflow consistently", () => {
@@ -2355,6 +2386,8 @@ describe("subagent interruption", () => {
     assert.match(props.worktree.description, /herdr only/);
     assert.match(props.worktree.description, /<repo-dir>-<name>/);
     assert.match(props.worktree.description, /overrides cwd/);
+    assert.match(props.worktree.description, /codegraph init/);
+    assert.match(props.worktree.description, /codegraph sync/);
   });
 
     it("registers subagents_status in the main session extension", () => {
@@ -2362,7 +2395,8 @@ describe("subagent interruption", () => {
     (subagentsModule as any).default(api);
     const tool = registeredTools.find((t) => t.name === "subagents_status");
     assert.ok(tool);
-    assert.match(tool.description, /NOT the same as subagents_list/);
+    assert.match(tool.description, /NOT subagents_list/);
+    assert.match(tool.description, /is not proof of death/);
   });
 
   it("lists running subagents with ids and live status", () => {
@@ -2475,6 +2509,103 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("reports live untracked panes as foreign instead of orphan/stalled", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      const result = testApi.handleSubagentsStatus({
+        listAllSurfacesFn: () => ["w1R:p2", "w1R:p9", "w1:p7"],
+        listNamedPanesFn: () => [
+          { surface: "w1R:p2", label: "issue-8-reviewer-r0", agentKind: "pi", agentStatus: "working", agentSession: "/sessions/reviewer.jsonl" },
+          { surface: "w1R:p9", label: "own-agent", agentKind: "claude", agentStatus: "idle", agentSession: "/sessions/mine.jsonl" },
+          { surface: "w1:p7", label: "leftover", agentStatus: "unknown", agentSession: null },
+        ],
+        discoverOrphansFn: () => [],
+        currentSessionFileFn: () => "/sessions/mine.jsonl",
+      });
+
+      const text = result.content[0].text;
+      assert.match(text, /\(0 tracked, 1 orphan, 2 live elsewhere\)/);
+      assert.match(text, /issue-8-reviewer-r0 \[live pane w1R:p2\] — live pi agent \(working\) owned by another pi session: \/sessions\/reviewer\.jsonl/);
+      assert.match(text, /own-agent \[live pane w1R:p9\] — live claude agent \(idle\) owned by this session/);
+      assert.match(text, /leftover \[orphan pane w1:p7\] — no live pi agent detected/);
+      assert.equal(text.includes("stalled"), false);
+
+      const foreign = result.details.entries.find((e: any) => e.surface === "w1R:p2");
+      assert.equal(foreign.origin, "live-pane");
+      assert.equal(foreign.kind, "foreign");
+      assert.equal(foreign.ownedByThisSession, false);
+      assert.equal(foreign.agentSession, "/sessions/reviewer.jsonl");
+      assert.equal(foreign.agentKind, "pi");
+      assert.equal(foreign.cli, "pi");
+
+      const own = result.details.entries.find((e: any) => e.surface === "w1R:p9");
+      assert.equal(own.kind, "foreign");
+      assert.equal(own.ownedByThisSession, true);
+
+      const orphan = result.details.entries.find((e: any) => e.surface === "w1:p7");
+      assert.equal(orphan.origin, "orphan-pane");
+      assert.equal(orphan.kind, "orphan");
+      assert.equal(orphan.agentStatus, "unknown");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("refuses to close a surface whose pane runs another session's live agent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    runningMap.clear();
+
+    try {
+      const refused = testApi.handleSubagentCleanup(
+        { id: "", name: "", surface: "w1R:p2" },
+        (surface: string) => closed.push(surface),
+        { findPaneFn: () => ({ surface: "w1R:p2", label: "reviewer", agentKind: "pi", agentStatus: "working", agentSession: "/sessions/reviewer.jsonl" }) },
+      );
+      assert.deepEqual(closed, []);
+      assert.equal(refused.details.refused, true);
+      assert.equal(refused.details.reason, "live-agent");
+      assert.match(refused.content[0].text, /Refused to close surface w1R:p2/);
+      assert.match(refused.content[0].text, /another pi session/);
+      assert.match(refused.content[0].text, /live pi agent/);
+
+      // A pane with no live agent still closes (real orphan cleanup).
+      const orphan = testApi.handleSubagentCleanup(
+        { surface: "w1R:p3" },
+        (surface: string) => closed.push(surface),
+        { findPaneFn: () => ({ surface: "w1R:p3", label: "leftover", agentStatus: "unknown", agentSession: null }) },
+      );
+      assert.deepEqual(closed, ["w1R:p3"]);
+      assert.match(orphan.content[0].text, /Closed surface w1R:p3/);
+
+      // No pane inventory (backend without agent metadata): permissive as before.
+      const unknown = testApi.handleSubagentCleanup(
+        { surface: "w9:p9" },
+        (surface: string) => closed.push(surface),
+        { findPaneFn: () => null },
+      );
+      assert.deepEqual(closed, ["w1R:p3", "w9:p9"]);
+      assert.match(unknown.content[0].text, /Closed surface w9:p9/);
+
+      // Tracked entries remain force-cleanable via an explicit surface/id.
+      runningMap.set("t1", makeRunning({ id: "t1", name: "TabWorker", surface: "w9:p1" }));
+      const tracked = testApi.handleSubagentCleanup(
+        { surface: "w9:p1" },
+        (surface: string) => closed.push(surface),
+        { findPaneFn: () => ({ surface: "w9:p1", label: "TabWorker", agentStatus: "working", agentSession: null }) },
+      );
+      assert.deepEqual(closed, ["w1R:p3", "w9:p9", "w9:p1"]);
+      assert.match(tracked.content[0].text, /Closed surface w9:p1/);
+      assert.equal(runningMap.size, 0);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
   it("closes a specified surface directly, removing any matching running entry", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2506,6 +2637,7 @@ describe("subagent interruption", () => {
       const orphan = testApi.handleSubagentCleanup(
         { surface: "pane-orphan" },
         (surface: string) => closedSurfaces.push(surface),
+        { findPaneFn: () => null },
       );
       assert.deepEqual(closedSurfaces, ["pane-t1", "pane-orphan"]);
       assert.match(orphan.content[0].text, /Closed surface pane-orphan/);
@@ -2517,6 +2649,7 @@ describe("subagent interruption", () => {
         () => {
           throw new Error("pane not found");
         },
+        { findPaneFn: () => null },
       );
       assert.match(failed.content[0].text, /Failed to close surface "pane-gone"/);
       assert.match(failed.content[0].text, /pane not found/);
@@ -2579,6 +2712,78 @@ describe("subagent interruption", () => {
     } finally {
       runningMap.clear();
     }
+  });
+
+  it("never reaps the pane this process itself runs in", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    runningMap.clear();
+    const previousSurface = process.env.PI_SUBAGENT_SURFACE;
+    const previousPane = process.env.HERDR_PANE_ID;
+
+    try {
+      const wt = { workspaceId: "w9", rootPane: "w9:p1", reap: true };
+
+      delete process.env.PI_SUBAGENT_SURFACE;
+      process.env.HERDR_PANE_ID = "w9:p1";
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface), () => []);
+      assert.deepEqual(closed, []);
+
+      delete process.env.HERDR_PANE_ID;
+      process.env.PI_SUBAGENT_SURFACE = "w9:p1";
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface), () => []);
+      assert.deepEqual(closed, []);
+
+      // A different pane of this process: the reap still works.
+      delete process.env.PI_SUBAGENT_SURFACE;
+      process.env.HERDR_PANE_ID = "w1:p1";
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface), () => []);
+      assert.deepEqual(closed, ["w9:p1"]);
+    } finally {
+      if (previousSurface === undefined) delete process.env.PI_SUBAGENT_SURFACE;
+      else process.env.PI_SUBAGENT_SURFACE = previousSurface;
+      if (previousPane === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = previousPane;
+      runningMap.clear();
+    }
+  });
+
+  it("leaves a worktree workspace open while a live agent pane is inside it", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closed: string[] = [];
+    runningMap.clear();
+
+    try {
+      const wt = { workspaceId: "w9", rootPane: "w9:p1", reap: true };
+
+      // A live agent pane in the same workspace: keep the workspace open.
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface), () => ["w9:p2"]);
+      assert.deepEqual(closed, []);
+
+      // A live pane in another workspace does not block the reap.
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface), () => ["w1:p1"]);
+      assert.deepEqual(closed, ["w9:p1"]);
+
+      // Unverifiable liveness: no reap, leave the workspace open.
+      testApi.maybeReapWorktreeWorkspace(wt, (surface: string) => closed.push(surface), () => null);
+      assert.deepEqual(closed, ["w9:p1"]);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("does not present a synthetic surface-gone exit code as a real one", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    assert.equal(
+      testApi.formatSubagentExitFallback("surface-gone", 1),
+      "Sub-agent pane was closed externally before it finished (exit status unknown)",
+    );
+    assert.equal(testApi.formatSubagentExitFallback("sentinel", 3), "Sub-agent exited with code 3");
+    assert.equal(testApi.formatSubagentExitFallback("sentinel", 0), "Sub-agent exited without output");
+    assert.equal(testApi.formatSubagentExitFallback(undefined, 1), "Sub-agent exited with code 1");
   });
 
   it("cleans stalled entries but leaves active ones when no target is given", () => {
@@ -2656,6 +2861,81 @@ describe("subagent interruption", () => {
       assert.equal(runningMap.has("a1"), false);
       assert.equal(result.details.status, "cleaned");
       assert.match(result.content[0].text, /forced subagent/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("refuses to clean a stalled entry whose pane still reports a live agent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closedSurfaces: string[] = [];
+    const aborted: string[] = [];
+    runningMap.clear();
+
+    try {
+      for (const id of ["s1", "s2"]) {
+        runningMap.set(id, makeRunning({
+          id,
+          name: id === "s1" ? "SlowStarter" : "Zombie",
+          surface: `pane-${id}`,
+          statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+          abortController: { abort: () => aborted.push(id) },
+        }));
+      }
+
+      const result = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup(
+          {},
+          (surface: string) => closedSurfaces.push(surface),
+          {
+            findPaneFn: (surface: string) =>
+              surface === "pane-s1"
+                ? { surface, label: "SlowStarter", agentKind: "pi", agentStatus: "working", agentSession: null }
+                : { surface, label: "Zombie", agentStatus: "unknown", agentSession: null },
+          },
+        ),
+      );
+
+      assert.deepEqual(closedSurfaces, ["pane-s2"]);
+      assert.deepEqual(aborted, ["s2"]);
+      assert.equal(runningMap.has("s1"), true);
+      assert.equal(runningMap.has("s2"), false);
+      assert.deepEqual(result.details.refused.map((r: any) => r.id), ["s1"]);
+      assert.match(result.content[0].text, /Refused 1 pane that still reports a live agent/);
+      assert.match(result.content[0].text, /SlowStarter/);
+      assert.match(result.content[0].text, /subagent_interrupt to cancel its turn/);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("refuses a force-clean while the pane reports a live agent, but an explicit surface still closes", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const closedSurfaces: string[] = [];
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "pane-a1", statusState: createStatusState({ source: "pi", startTimeMs: 0 }) }));
+      const livePane = { surface: "pane-a1", label: "Worker", agentKind: "pi", agentStatus: "working", agentSession: null };
+
+      const refused = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup({ id: "a1" }, (surface: string) => closedSurfaces.push(surface), { findPaneFn: () => livePane }),
+      );
+      assert.deepEqual(closedSurfaces, []);
+      assert.equal(runningMap.has("a1"), true);
+      assert.equal(refused.details.status, "refused");
+      assert.match(refused.content[0].text, /Refused to clean up 1 subagent/);
+      assert.match(refused.content[0].text, /subagent_interrupt to cancel its turn/);
+
+      // The explicit surface path stays the deliberate escape hatch.
+      const forced = withMockedNow(200_000, () =>
+        testApi.handleSubagentCleanup({ surface: "pane-a1" }, (surface: string) => closedSurfaces.push(surface), { findPaneFn: () => livePane }),
+      );
+      assert.deepEqual(closedSurfaces, ["pane-a1"]);
+      assert.equal(runningMap.has("a1"), false);
+      assert.match(forced.content[0].text, /Closed surface pane-a1/);
     } finally {
       runningMap.clear();
     }
@@ -3493,5 +3773,178 @@ describe("poll abort controller lifecycle", () => {
     (globalThis as any)[KEY] = poisoned;
     subagentsModule.__test__.rotateModuleAbortController();
     assert.equal(((globalThis as any)[KEY] as AbortController).signal.aborted, false);
+  });
+});
+
+describe("pane inventory", () => {
+  it("parses herdr pane list entries with agent metadata", () => {
+    const panes = parseHerdrPaneList({
+      result: {
+        panes: [
+          { pane_id: "w1R:p2", label: "issue-8-reviewer-r0", agent: "pi", agent_status: "working", agent_session: { agent: "pi", kind: "path", source: "herdr:pi", value: "/s/86611d6a.jsonl" } },
+          { pane_id: "w1R:p3", label: "leftover", agent_status: "unknown" },
+          { pane_id: "w1:p1", label: "   ", agent: "  ", agent_status: "  ", agent_session: "" },
+          { pane_id: "w1:p2", label: "legacy-agent", agent: "pi", agent_status: "idle", agent_session: "/legacy.jsonl" },
+          { pane_id: "", label: "no-id" },
+          { pane_id: "w1:p9" },
+          "nonsense",
+        ],
+      },
+    });
+
+    assert.deepEqual(panes, [
+      { surface: "w1R:p2", label: "issue-8-reviewer-r0", agentStatus: "working", agentKind: "pi", agentSession: "/s/86611d6a.jsonl" },
+      { surface: "w1R:p3", label: "leftover", agentStatus: "unknown", agentKind: null, agentSession: null },
+      { surface: "w1:p1", label: null, agentStatus: null, agentKind: null, agentSession: null },
+      { surface: "w1:p2", label: "legacy-agent", agentStatus: "idle", agentKind: "pi", agentSession: "/legacy.jsonl" },
+      { surface: "w1:p9", label: null, agentStatus: null, agentKind: null, agentSession: null },
+    ]);
+
+    assert.deepEqual(parseHerdrPaneList(null), []);
+    assert.deepEqual(parseHerdrPaneList({ result: { panes: "nope" } }), []);
+  });
+
+  it("treats every explicit agent state except unknown as alive", () => {
+    assert.equal(isLiveAgentStatus("working"), true);
+    assert.equal(isLiveAgentStatus("idle"), true);
+    assert.equal(isLiveAgentStatus("blocked"), true);
+    assert.equal(isLiveAgentStatus("something-new"), true);
+    assert.equal(isLiveAgentStatus("unknown"), false);
+    assert.equal(isLiveAgentStatus("UNKNOWN"), false);
+    assert.equal(isLiveAgentStatus(""), false);
+    assert.equal(isLiveAgentStatus(null), false);
+    assert.equal(isLiveAgentStatus(undefined), false);
+  });
+});
+
+describe("codegraph.ts", () => {
+  describe("planCodegraphPreparation", () => {
+    it("skips when the codegraph CLI is not on PATH", () => {
+      assert.deepEqual(planCodegraphPreparation({ codegraphOnPath: false, mainCheckoutHasIndex: true, worktreeHasIndex: true }), {
+        action: "skip",
+        reason: "the codegraph CLI is not on PATH",
+      });
+    });
+
+    it("skips when the main checkout carries no .codegraph marker", () => {
+      assert.deepEqual(planCodegraphPreparation({ codegraphOnPath: true, mainCheckoutHasIndex: false, worktreeHasIndex: false }), {
+        action: "skip",
+        reason: "the main checkout has no .codegraph directory",
+      });
+    });
+
+    it("inits a checkout without an index and syncs one that already has it", () => {
+      assert.deepEqual(planCodegraphPreparation({ codegraphOnPath: true, mainCheckoutHasIndex: true, worktreeHasIndex: false }), {
+        action: "init",
+      });
+      assert.deepEqual(planCodegraphPreparation({ codegraphOnPath: true, mainCheckoutHasIndex: true, worktreeHasIndex: true }), {
+        action: "sync",
+      });
+    });
+  });
+
+  describe("commandOnPath", () => {
+    it("finds an executable on PATH and reports missing ones", () => {
+      withTempDir((dir) => {
+        writeFileSync(join(dir, "codegraph"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        assert.equal(commandOnPath("codegraph", { PATH: dir }), true);
+        assert.equal(commandOnPath("codegraph", { PATH: "" }), false);
+        assert.equal(commandOnPath("codegraph", { PATH: join(dir, "nope") }), false);
+        assert.equal(commandOnPath("codegraph", { PATH: `${join(dir, "nope")}:${dir}` }), true);
+      });
+    });
+  });
+
+  describe("prepareCodegraphForWorktree", () => {
+    it("skips — and never spawns — when codegraph is not enabled", async () => {
+      await withTempDirAsync(async (dir) => {
+        let ran = false;
+        const outcome = await prepareCodegraphForWorktree({
+          mainCheckoutPath: dir,
+          worktreePath: dir,
+          hasCommand: () => true,
+          run: () => {
+            ran = true;
+          },
+        });
+        assert.equal(outcome.action, "skip");
+        assert.equal(ran, false);
+      });
+    });
+
+    it("runs `codegraph init --yes <checkout>` for a checkout without an index", async () => {
+      await withTempDirAsync(async (dir) => {
+        const main = join(dir, "repo");
+        const worktree = join(dir, "repo-feature");
+        mkdirSync(join(main, ".codegraph"), { recursive: true });
+        mkdirSync(worktree, { recursive: true });
+        const calls: Array<{ command: string; args: string[]; options: { cwd: string; timeout: number } }> = [];
+        const prepared: string[] = [];
+        const outcome = await prepareCodegraphForWorktree({
+          mainCheckoutPath: main,
+          worktreePath: worktree,
+          hasCommand: (command) => command === "codegraph",
+          run: (command, args, options) => {
+            calls.push({ command, args, options });
+          },
+          onPrepare: (action) => {
+            prepared.push(action);
+          },
+          timeoutMs: 1234,
+        });
+        assert.deepEqual(outcome, { action: "init" });
+        assert.deepEqual(prepared, ["init"]);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].command, "codegraph");
+        assert.deepEqual(calls[0].args, ["init", "--yes", worktree]);
+        assert.equal(calls[0].options.cwd, worktree);
+        assert.equal(calls[0].options.timeout, 1234);
+      });
+    });
+
+    it("runs `codegraph sync <checkout>` when the worktree already has an index", async () => {
+      await withTempDirAsync(async (dir) => {
+        const main = join(dir, "repo");
+        const worktree = join(dir, "repo-feature");
+        mkdirSync(join(main, ".codegraph"), { recursive: true });
+        mkdirSync(join(worktree, ".codegraph"), { recursive: true });
+        const calls: string[][] = [];
+        const outcome = await prepareCodegraphForWorktree({
+          mainCheckoutPath: main,
+          worktreePath: worktree,
+          hasCommand: () => true,
+          run: (_command, args) => {
+            calls.push(args);
+          },
+        });
+        assert.deepEqual(outcome, { action: "sync" });
+        assert.deepEqual(calls, [["sync", worktree]]);
+      });
+    });
+
+    it("turns a failed command into a warning instead of throwing", async () => {
+      await withTempDirAsync(async (dir) => {
+        const main = join(dir, "repo");
+        const worktree = join(dir, "repo-feature");
+        mkdirSync(join(main, ".codegraph"), { recursive: true });
+        mkdirSync(worktree, { recursive: true });
+        const failure = Object.assign(new Error("Command failed"), { stderr: "boom: index locked\n" });
+        const outcome = await prepareCodegraphForWorktree({
+          mainCheckoutPath: main,
+          worktreePath: worktree,
+          hasCommand: () => true,
+          run: () => {
+            throw failure;
+          },
+        });
+        assert.equal(outcome.action, "init");
+        assert.match(outcome.warning ?? "", /codegraph init failed/);
+        assert.match(outcome.warning ?? "", /boom: index locked/);
+      });
+    });
+
+    it("defaults the command timeout to the exported budget", () => {
+      assert.equal(CODEGRAPH_COMMAND_TIMEOUT_MS, 10 * 60 * 1000);
+    });
   });
 });

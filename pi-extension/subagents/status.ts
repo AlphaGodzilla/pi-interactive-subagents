@@ -11,10 +11,38 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
+/**
+ * Kind shown for a subagent entry.
+ *
+ * Run kinds come from the tracked run-state machine (see classifyStatus):
+ * - `starting` / `active` / `waiting` describe a tracked child this session
+ *   spawned and is observing; `waiting` covers a healthy child that is idle or
+ *   is itself waiting on its own subagents (never reported as `stalled`).
+ * - `running` is the elapsed-only fallback for claude-backed subagents.
+ * - `stalled` is reserved for a tracked child whose activity snapshot went
+ *   missing/invalid for SNAPSHOT_STALLED_AFTER_MS (see classifyProblemState).
+ *
+ * Presence kinds describe panes this session does not track:
+ * - `foreign`: a LIVE pi agent pane owned by another pi session (a nested
+ *   orchestrator's subagent, or another window's agent). It is alive, so it
+ *   must never be reported as stalled/orphan and must never be closed from
+ *   this session — steer/interrupt it from the session that spawned it.
+ * - `orphan`: a labeled pane with no live agent detected (left behind by a
+ *   failed launch, a restart, or a crashed child). Closing it is possible but
+ *   kills whatever else may still run inside the pane.
+ */
+export type SubagentStatusKind =
+  | "starting"
+  | "active"
+  | "waiting"
+  | "stalled"
+  | "running"
+  | "foreign"
+  | "orphan";
 export type SubagentStatusSource = "pi" | "claude";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
+export type SubagentStatusOrigin = "registry" | "orphan-process" | "orphan-pane" | "live-pane";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
@@ -510,4 +538,22 @@ export function formatStatusAggregate(lines: string[], lineLimit: number): strin
   const bulletLines = visibleLines.map((line) => `• ${line}`);
   if (overflow > 0) bulletLines.push(`• +${overflow} more running.`);
   return `Subagent status:\n${bulletLines.join("\n")}`;
+}
+
+/**
+ * Guidance appended to a wake that contains a `stalled` transition: the label
+ * only means "no activity snapshot could be read", which a slow child start, a
+ * long tool call and a provider stall all look like. Spelled out here because
+ * the bare status line otherwise invites the model to reach for
+ * subagent_interrupt / subagent_cleanup.
+ */
+export const STALLED_WAKE_HINT =
+  'Note: "stalled" means no activity update from the child for ~1 minute — a slow start, a long tool call, or a ' +
+  "provider stall all look the same. It is not proof the subagent died: do not interrupt or clean it up over " +
+  "this line — if it exits, its result (or failure) is delivered automatically.";
+
+/** Wake text for a batch of status transitions; stalled batches carry the hint. */
+export function formatStatusWake(lines: string[], lineLimit: number, stalled: boolean): string {
+  const aggregate = formatStatusAggregate(lines, lineLimit);
+  return stalled ? `${aggregate}\n${STALLED_WAKE_HINT}` : aggregate;
 }

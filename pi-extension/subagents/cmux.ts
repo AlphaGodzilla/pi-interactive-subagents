@@ -18,6 +18,8 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
+import { prepareCodegraphForWorktree, type CodegraphAction, type CodegraphPreparation } from "./codegraph.ts";
+
 // ── CLI invocation wrappers ─────────────────────────────────────────────
 // Mux CLIs (herdr/tmux/wezterm/cmux/zellij) print machine-readable error
 // payloads to stderr — e.g. `{"error":{"code":"pane_not_found",...}}` when
@@ -900,6 +902,13 @@ export interface HerdrWorktreeContext {
    * was already open — the user is working in it, so leave it alone.
    */
   openedByUs: boolean;
+  /**
+   * Outcome of the automatic CodeGraph index preparation for this checkout
+   * (only when the repo has codegraph enabled: `.codegraph` in the main
+   * checkout + the `codegraph` CLI on PATH). Callers surface `warning` when
+   * the command failed instead of failing the spawn.
+   */
+  codegraph?: CodegraphPreparation;
 }
 
 /**
@@ -972,6 +981,50 @@ function normalizeComparablePath(p: string): string {
   return out.replace(/\/+$/, "");
 }
 
+/**
+ * Main checkout root for a directory inside the repo: the parent of the git
+ * common dir (identical to the toplevel for the main checkout, and the main
+ * checkout itself for a linked worktree). Null when git cannot tell.
+ */
+function resolveMainCheckoutRoot(fromDir: string): string | null {
+  try {
+    const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      cwd: fromDir,
+      encoding: "utf8",
+    }).trim();
+    return commonDir ? dirname(commonDir) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Optional hooks for the worktree resolvers — UI feedback while a checkout is prepared. */
+export interface WorktreePreparationHooks {
+  /** Called before the blocking CodeGraph index command runs on a checkout. */
+  onCodegraphPrepare?: (action: CodegraphAction, worktreePath: string) => void;
+}
+
+/**
+ * Attach the CodeGraph index preparation outcome for a worktree checkout.
+ * `mainCheckoutPath` carries the `.codegraph` marker; the worktree gets
+ * `codegraph init` (no index yet) or `codegraph sync` (index exists).
+ * Blocking and best-effort — failures ride along as `warning`.
+ */
+async function withCodegraphPreparation(
+  context: HerdrWorktreeContext,
+  mainCheckoutPath: string,
+  hooks?: WorktreePreparationHooks,
+): Promise<HerdrWorktreeContext> {
+  const codegraph = await prepareCodegraphForWorktree({
+    mainCheckoutPath,
+    worktreePath: context.path,
+    ...(hooks?.onCodegraphPrepare
+      ? { onPrepare: (action: CodegraphAction) => hooks.onCodegraphPrepare!(action, context.path) }
+      : {}),
+  });
+  return { ...context, codegraph };
+}
+
 /** Pick the worktree entry whose checkout is exactly `path` (pure, unit-testable). */
 export function pickWorktreeByPath(
   worktrees: HerdrWorktreeEntry[],
@@ -993,9 +1046,10 @@ export function pickWorktreeByPath(
  * by herdr — including plain directories and main checkouts — so callers can
  * fall back to a regular placement.
  */
-export function findWorktreeContextByPath(
+export async function findWorktreeContextByPath(
   worktreePath: string,
-): { ok: true; context: HerdrWorktreeContext } | { ok: false; error: string } {
+  hooks?: WorktreePreparationHooks,
+): Promise<{ ok: true; context: HerdrWorktreeContext } | { ok: false; error: string }> {
   const backend = getMuxBackend();
   if (backend !== "herdr") {
     return {
@@ -1041,7 +1095,8 @@ export function findWorktreeContextByPath(
     const out = execFileSync("herdr", ["worktree", "open", "--cwd", mainRoot, "--path", existing.path], {
       encoding: "utf8",
     });
-    return { ok: true, context: parseWorktreeCommandOutput(out) };
+    const context = parseWorktreeCommandOutput(out);
+    return { ok: true, context: await withCodegraphPreparation(context, mainRoot, hooks) };
   } catch (error: any) {
     const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
     return {
@@ -1051,10 +1106,11 @@ export function findWorktreeContextByPath(
   }
 }
 
-export function resolveWorktreeContext(
+export async function resolveWorktreeContext(
   name: string,
   cwd: string,
-): { ok: true; context: HerdrWorktreeContext } | { ok: false; error: string } {
+  hooks?: WorktreePreparationHooks,
+): Promise<{ ok: true; context: HerdrWorktreeContext } | { ok: false; error: string }> {
   const backend = getMuxBackend();
   if (backend !== "herdr") {
     return {
@@ -1097,7 +1153,10 @@ export function resolveWorktreeContext(
           "--no-focus",
         ];
     const out = execFileSync("herdr", args, { encoding: "utf8" });
-    return { ok: true, context: parseWorktreeCommandOutput(out) };
+    const context = parseWorktreeCommandOutput(out);
+    // The `.codegraph` marker lives in the main checkout; `cwd` may itself be
+    // a linked worktree, so derive the main root from the git common dir.
+    return { ok: true, context: await withCodegraphPreparation(context, resolveMainCheckoutRoot(cwd) ?? repoRoot, hooks) };
   } catch (error: any) {
     const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
     return {
@@ -1801,10 +1860,8 @@ export function listAllSurfaces(): string[] {
 
   try {
     if (backend === "herdr") {
-      const parsed = JSON.parse(execFileSync("herdr", ["pane", "list"], { encoding: "utf8" }));
-      const panes = parsed?.result?.panes;
-      if (!Array.isArray(panes)) return [];
-      return panes.filter((p) => typeof p?.pane_id === "string").map((p) => p.pane_id);
+      const panes = readPaneInventory();
+      return panes ? panes.map((p) => p.surface) : [];
     }
 
     if (backend === "tmux") {
@@ -1846,49 +1903,144 @@ export function listAllSurfaces(): string[] {
 }
 
 /**
- * List panes the orchestrator itself created and named for subagents that are
- * still present in the multiplexer but have NO running entry anymore (e.g.
- * left behind by a session that restarted, or a launch that never started pi).
+ * A pane as reported by the multiplexer's own pane inventory.
+ */
+export interface MuxPaneInfo {
+  surface: string;
+  /** Pane label (subagent panes are labeled with the subagent name). */
+  label: string | null;
+  /**
+   * herdr only: agent state herdr tracks for the pane
+   * ("working" | "idle" | "blocked" | "unknown"); null when the backend does
+   * not report one. "unknown" means herdr sees no live agent in the pane.
+   */
+  agentStatus: string | null;
+  /**
+   * herdr only: agent kind herdr attributes the pane to (e.g. "pi"); null
+   * when the backend does not report one.
+   */
+  agentKind: string | null;
+  /** herdr only: session file of the agent running in the pane, if any. */
+  agentSession: string | null;
+}
+
+/**
+ * Pure: extract the session path from herdr's `agent_session` value, which is
+ * an object `{ agent, kind, source, value }` (older payloads: a plain string).
+ */
+export function parseHerdrAgentSession(value: unknown): string | null {
+  const raw = typeof value === "object" && value !== null ? (value as any).value : value;
+  return typeof raw === "string" && raw.trim() !== "" ? raw : null;
+}
+
+/**
+ * Pure: parse `herdr pane list` JSON into pane entries (exported for tests).
+ */
+export function parseHerdrPaneList(parsed: unknown): MuxPaneInfo[] {
+  const panes = (parsed as any)?.result?.panes;
+  if (!Array.isArray(panes)) return [];
+  const out: MuxPaneInfo[] = [];
+  for (const p of panes) {
+    if (typeof p?.pane_id !== "string" || p.pane_id === "") continue;
+    out.push({
+      surface: p.pane_id,
+      label: typeof p?.label === "string" && p.label.trim() !== "" ? p.label : null,
+      agentStatus: typeof p?.agent_status === "string" && p.agent_status.trim() !== "" ? p.agent_status : null,
+      agentKind: typeof p?.agent === "string" && p.agent.trim() !== "" ? p.agent : null,
+      agentSession: parseHerdrAgentSession(p?.agent_session),
+    });
+  }
+  return out;
+}
+
+/**
+ * Whether a reported pane agent status means a live agent is running in it.
+ * Anything that is not an explicit "unknown" counts as alive, so an unknown
+ * future state is never mistaken for "safe to close".
+ */
+export function isLiveAgentStatus(status: string | null | undefined): boolean {
+  const value = typeof status === "string" ? status.trim().toLowerCase() : "";
+  return value !== "" && value !== "unknown";
+}
+
+/**
+ * herdr pane inventory (all workspaces). Returns null when the backend cannot
+ * report one (non-herdr / no mux) or the CLI call failed; callers that make
+ * destructive decisions must treat null as "cannot verify".
+ */
+export function readPaneInventory(): MuxPaneInfo[] | null {
+  const backend = getMuxBackend();
+  if (backend !== "herdr") return null;
+  try {
+    const parsed = JSON.parse(execFileSync("herdr", ["pane", "list"], { encoding: "utf8" }));
+    return parseHerdrPaneList(parsed);
+  } catch {
+    return null;
+  }
+}
+
+/** Look up a pane in the inventory; null when unknown or not reported. */
+export function findPaneInfo(surface: string): MuxPaneInfo | null {
+  const panes = readPaneInventory();
+  if (!panes) return null;
+  return panes.find((p) => p.surface === surface) ?? null;
+}
+
+/**
+ * Surfaces of panes that report a live agent (any workspace), or null when the
+ * inventory cannot be read. Used to avoid recycling a workspace that still
+ * hosts a live agent pane.
+ */
+export function listLiveAgentPaneSurfaces(): string[] | null {
+  const backend = getMuxBackend();
+  // Backends without a pane inventory have nothing to protect (worktree
+  // reaping is herdr-only): report an empty, verified list.
+  if (backend !== "herdr") return [];
+  const panes = readPaneInventory();
+  if (!panes) return null;
+  return panes.filter((p) => isLiveAgentStatus(p.agentStatus)).map((p) => p.surface);
+}
+
+/**
+ * List every labeled pane the multiplexer reports (candidate subagent panes),
+ * together with herdr's live-agent metadata.
  *
- * Naming/labelling ability differs per backend:
- * - herdr: panes are labelled with the subagent name (`pane rename`).
- * - zellij: tabs/panes are renamed to the subagent name.
+ * Callers must NOT treat a labeled pane as dead: a labeled pane may still host
+ * a live agent owned by ANOTHER pi session (a nested orchestrator's subagent,
+ * another window) — `agentStatus` is what distinguishes `foreign` from
+ * `orphan`. Naming/labelling ability differs per backend:
+ * - herdr: panes are labelled with the subagent name (`pane rename`) and carry
+ *   `agent_status` / `agent_session` for the pane's live agent.
+ * - zellij: tabs/panes are renamed to the subagent name (no agent metadata).
  * - cmux: surfaces are renamed to the subagent name (`rename-tab`); the tree
  *   text does not reliably expose names, so discovery is best-effort.
  * - tmux / wezterm: panes have no name concept we set at creation — orphan
  *   pane discovery is unavailable; rely on process-based discovery instead.
  */
-export function listSubagentPanes(): Array<{ surface: string; label: string }> {
+export function listSubagentPanes(): MuxPaneInfo[] {
   const backend = getMuxBackend();
   if (!backend) return [];
 
-  try {
-    if (backend === "herdr") {
-      const parsed = JSON.parse(execFileSync("herdr", ["pane", "list"], { encoding: "utf8" }));
-      const panes = parsed?.result?.panes;
-      if (!Array.isArray(panes)) return [];
-      return panes
-        .filter((p) => typeof p?.pane_id === "string" && typeof p?.label === "string" && p.label.trim() !== "")
-        .map((p) => ({ surface: p.pane_id, label: p.label }));
-    }
+  if (backend === "herdr") {
+    const panes = readPaneInventory();
+    if (!panes) return [];
+    return panes.filter((p) => p.label !== null);
+  }
 
-    if (backend === "zellij") {
+  if (backend === "zellij") {
+    try {
       const raw = zellijActionSync(["query-pane-names"]);
-      return raw
-        .split("\n")
-        .map((line) => {
-          const m = line.trim().match(/^(\d+):(\d+):(.+)$/);
-          if (!m) return null;
-          const name = m[3];
-          return name ? { surface: `pane:${m[2]}`, label: name } : null;
-        })
-        .filter((s): s is { surface: string; label: string } | null => !!s) as Array<{
-        surface: string;
-        label: string;
-      }>;
+      const panes: MuxPaneInfo[] = [];
+      for (const line of raw.split("\n")) {
+        const m = line.trim().match(/^(\d+):(\d+):(.+)$/);
+        if (!m || !m[3]) continue;
+        // zellij has no per-pane agent metadata: liveness stays unknown.
+        panes.push({ surface: `pane:${m[2]}`, label: m[3], agentStatus: null, agentKind: null, agentSession: null });
+      }
+      return panes;
+    } catch {
+      // Unsupported or unparseable — orphan pane discovery unavailable.
     }
-  } catch {
-    // Unsupported or unparseable — orphan pane discovery unavailable.
   }
   return [];
 }
