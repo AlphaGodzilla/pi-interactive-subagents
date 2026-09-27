@@ -57,6 +57,7 @@ import {
   observeStatus,
   loadStatusConfig,
 } from "./status.ts";
+import { DEFAULT_PI_COMMAND, getAgentConfigDir, resolvePiCommand } from "./pi-command.ts";
 import {
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -251,11 +252,6 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   }
 
   return denied;
-}
-
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
-function getAgentConfigDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
 function getBundledAgentsDir(): string {
@@ -578,6 +574,15 @@ function formatSubagentExitFallback(
   return exitCode !== 0 ? `Sub-agent exited with code ${exitCode}` : "Sub-agent exited without output";
 }
 
+/**
+ * Human-facing "resume this session" hint. Uses the configured pi command
+ * (`piBin` / PI_SUBAGENT_PI_BIN) so a copied hint reproduces the environment
+ * the subagent was launched with.
+ */
+function formatResumeHint(sessionFile: string): string {
+  return `\n\nSession: ${sessionFile}\nResume: ${resolvePiCommand().command} --session ${sessionFile}`;
+}
+
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
@@ -585,9 +590,7 @@ function resolveResultPresentation(
   >,
   name: string,
 ): string {
-  const sessionRef = result.sessionFile
-    ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-    : "";
+  const sessionRef = result.sessionFile ? formatResumeHint(result.sessionFile) : "";
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -1896,7 +1899,7 @@ async function launchSubagent(
   // ── Pi CLI path ──
 
   // Build pi command
-  const parts: string[] = ["pi"];
+  const parts: string[] = [resolvePiCommand().command];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -2371,7 +2374,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+              const sessionRef = result.sessionFile ? formatResumeHint(result.sessionFile) : "";
               pi.sendMessage(
                 {
                   customType: "subagent_ping",
@@ -2403,6 +2406,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  piCommand: resolvePiCommand().command,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                 },
@@ -2837,7 +2841,7 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
       description:
         "Resume a previous sub-agent session in a new multiplexer surface — use it to re-attach to a cancelled/orphaned " +
         "sub-agent or to give a finished one follow-up work (the session path is printed in the subagent's result " +
-        "message: `Session: <path>` / `Resume: pi --session <path>`). " +
+        "message: `Session: <path>` / `Resume: <pi command> --session <path>`). " +
         "Surface placement mirrors subagent spawning: `mux: \"pane\"` (default) splits a pane; `mux: \"tab\"` opens a tab. " +
         "When the session's recorded working directory is a herdr Git worktree that still exists, the resumed session " +
         "lands back in that worktree's own workspace (reusing the fresh root pane / opening a tab when already open) " +
@@ -2956,7 +2960,7 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const parts = [resolvePiCommand().command, "--session", shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -3075,7 +3079,7 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
             updateWidget();
 
             if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
+              const sessionRef = formatResumeHint(params.sessionPath);
               pi.sendMessage(
                 {
                   customType: "subagent_ping",
@@ -3115,6 +3119,7 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: params.sessionPath,
+                  piCommand: resolvePiCommand().command,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                 },
               },
@@ -3242,7 +3247,11 @@ async function autoConfirmMissingSessionCwd(surface: string): Promise<void> {
           if (details.sessionFile) {
             contentLines.push("");
             contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
-            contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
+            const piCommand =
+              typeof details.piCommand === "string" && details.piCommand.length > 0
+                ? details.piCommand
+                : DEFAULT_PI_COMMAND;
+            contentLines.push(theme.fg("dim", `Resume:  ${piCommand} --session ${details.sessionFile}`));
           }
         } else {
           // Collapsed: preview + expand hint

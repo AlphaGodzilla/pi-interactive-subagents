@@ -63,6 +63,14 @@ import {
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
+  DEFAULT_PI_COMMAND,
+  PI_COMMAND_ENV_VAR,
+  getAgentConfigDir,
+  piCommandConfigPaths,
+  readPiCommandConfig,
+  resolvePiCommand,
+} from "../pi-extension/subagents/pi-command.ts";
+import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -1987,6 +1995,18 @@ describe("subagent activity snapshots", () => {
 });
 
 describe("subagent interruption", () => {
+  const originalPiBin = process.env.PI_SUBAGENT_PI_BIN;
+
+  before(() => {
+    // Resume hints render the configured pi command; pin it so a local
+    // config.json `piBin` cannot change these assertions.
+    process.env.PI_SUBAGENT_PI_BIN = DEFAULT_PI_COMMAND;
+  });
+
+  after(() => {
+    if (originalPiBin === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+    else process.env.PI_SUBAGENT_PI_BIN = originalPiBin;
+  });
   function makeRunning(overrides: Record<string, unknown> = {}) {
     return {
       id: "a1",
@@ -2342,6 +2362,29 @@ describe("subagent interruption", () => {
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
     assert.match(presentation, /Resume: pi --session/);
+  });
+
+  it("renders the configured pi command in resume hints", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const previous = process.env.PI_SUBAGENT_PI_BIN;
+    process.env.PI_SUBAGENT_PI_BIN = "spi --no-skills";
+
+    try {
+      const presentation = testApi.resolveResultPresentation(
+        {
+          exitCode: 1,
+          elapsed: 2,
+          summary: "boom",
+          sessionFile: "/tmp/subagent.jsonl",
+        },
+        "Worker",
+      );
+
+      assert.match(presentation, /Resume: spi --no-skills --session \/tmp\/subagent\.jsonl/);
+    } finally {
+      if (previous === undefined) delete process.env.PI_SUBAGENT_PI_BIN;
+      else process.env.PI_SUBAGENT_PI_BIN = previous;
+    }
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -3945,6 +3988,102 @@ describe("codegraph.ts", () => {
 
     it("defaults the command timeout to the exported budget", () => {
       assert.equal(CODEGRAPH_COMMAND_TIMEOUT_MS, 10 * 60 * 1000);
+    });
+  });
+});
+
+describe("pi-command.ts", () => {
+  it("defaults to pi when nothing is configured", () => {
+    const resolved = resolvePiCommand({ env: {}, configPaths: [] });
+
+    assert.deepEqual(resolved, { command: DEFAULT_PI_COMMAND, source: "default" });
+  });
+
+  it("lets PI_SUBAGENT_PI_BIN override config files", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, JSON.stringify({ piBin: "from-config" }));
+
+      const resolved = resolvePiCommand({
+        env: { [PI_COMMAND_ENV_VAR]: "  spi --no-skills  " },
+        configPaths: [configPath],
+      });
+
+      assert.deepEqual(resolved, { command: "spi --no-skills", source: `env:${PI_COMMAND_ENV_VAR}` });
+    });
+  });
+
+  it("reads the first config file that declares piBin", () => {
+    withTempDir((dir) => {
+      const first = join(dir, "config.json");
+      const second = join(dir, "extensions", "pi-interactive-subagents", "config.json");
+      mkdirSync(dirname(second), { recursive: true });
+      writeFileSync(
+        first,
+        JSON.stringify({ status: { enabled: true }, piBin: "spi --no-skills --skill ~/.pi/skills" }),
+      );
+      writeFileSync(second, JSON.stringify({ piBin: "later-command" }));
+
+      const resolved = resolvePiCommand({ env: {}, configPaths: [first, second] });
+
+      assert.deepEqual(resolved, {
+        command: "spi --no-skills --skill ~/.pi/skills",
+        source: first,
+      });
+    });
+  });
+
+  it("keeps looking after a config file without piBin", () => {
+    withTempDir((dir) => {
+      const first = join(dir, "config.json");
+      const second = join(dir, "extensions", "pi-interactive-subagents", "config.json");
+      mkdirSync(dirname(second), { recursive: true });
+      writeFileSync(first, JSON.stringify({ status: { enabled: true } }));
+      writeFileSync(second, JSON.stringify({ piBin: "spi" }));
+
+      const resolved = resolvePiCommand({ env: {}, configPaths: [first, second] });
+
+      assert.deepEqual(resolved, { command: "spi", source: second });
+    });
+  });
+
+  it("rejects a malformed piBin instead of silently ignoring it", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, JSON.stringify({ piBin: 42 }));
+
+      assert.throws(() => readPiCommandConfig(configPath), /piBin must be a non-empty string/);
+
+      writeFileSync(configPath, JSON.stringify({ piBin: "   " }));
+
+      assert.throws(() => readPiCommandConfig(configPath), /piBin must be a non-empty string/);
+    });
+  });
+
+  it("reports invalid JSON in a pi-command config file", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      writeFileSync(configPath, "{\n");
+
+      assert.throws(() => readPiCommandConfig(configPath), /Invalid JSON in subagent config .*config\.json/);
+    });
+  });
+
+  it("treats a missing config file as unconfigured", () => {
+    withTempDir((dir) => {
+      assert.equal(readPiCommandConfig(join(dir, "config.json")), undefined);
+    });
+  });
+
+  it("orders candidates extension-dir first and follows PI_CODING_AGENT_DIR", () => {
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent2");
+      const paths = piCommandConfigPaths(agentDir);
+
+      assert.equal(paths.length, 2);
+      assert.equal(paths[0], fileURLToPath(new URL("../config.json", import.meta.url)));
+      assert.equal(paths[1], join(agentDir, "extensions", "pi-interactive-subagents", "config.json"));
+      assert.equal(getAgentConfigDir({ PI_CODING_AGENT_DIR: agentDir }), agentDir);
     });
   });
 });

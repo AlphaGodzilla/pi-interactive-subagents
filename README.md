@@ -135,7 +135,7 @@ These labels are no longer derived from session-file growth. Session JSONL is st
 
 #### Configuration
 
-Status display is controlled by `config.json` in the extension directory. Copy `config.json.example` to get started:
+Status display is controlled by `config.json` in the extension directory; the same file also accepts the optional `piBin` key described below. Copy `config.json.example` to get started:
 
 ```bash
 cp config.json.example config.json
@@ -145,11 +145,24 @@ cp config.json.example config.json
 {
   "status": {
     "enabled": true
-  }
+  },
+  "piBin": "pi"
 }
 ```
 
 `config.json` is gitignored so local overrides don't get committed.
+
+#### Pi command (`piBin`)
+
+Pi-backed subagents are launched with a hardcoded `pi` unless a command is configured. The optional top-level `piBin` string in `config.json` replaces it verbatim:
+
+- The value is a **full command line** — executable plus any arguments, e.g. `"piBin": "spi --no-skills --skill ~/.pi/skills"`. The extension appends its own arguments after it (`--session`, `-e …/subagent-done.ts`, `--model`/`--provider`, `--tools`, `--append-system-prompt`, the task prompt).
+- The `PI_SUBAGENT_PI_BIN` environment variable overrides `piBin`.
+- Config files are read in this order: `config.json` in the extension directory, then `$PI_CODING_AGENT_DIR/extensions/pi-interactive-subagents/config.json`. With neither present the default `pi` is used.
+- **Shell aliases do not work.** Launch scripts run in a non-interactive `bash` (`#!/bin/bash`, invoked as `bash <script>`), so `.zshrc`/`.bashrc` aliases and functions are out of scope; `"piBin": "spi"` only works when `spi` is an executable on `PATH`. Use a real executable or a wrapper script.
+- `subagent_resume` launches with the same command, and the `Resume: …` hints printed in results/pings use it too.
+
+The exact invocation is kept in the launch script (`<artifacts>/subagent-scripts/<name>-<id>.sh`) for debugging.
 
 ---
 
