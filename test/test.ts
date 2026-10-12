@@ -71,6 +71,28 @@ import {
   resolvePiCommand,
 } from "../pi-extension/subagents/pi-command.ts";
 import {
+  THINKING_LEVELS,
+  clampThinkingLevel,
+  loadModelPresetConfig,
+  mergeConfigObjects,
+  modelPresetConfigPaths,
+  parseModelPresetConfig,
+  readModelPresetConfigFile,
+  resolveSubagentModel,
+  splitThinkingSuffix,
+  supportedThinkingLevels,
+  type ModelPresetConfig,
+} from "../pi-extension/subagents/model-presets.ts";
+import {
+  chooseSubagentModel,
+  chooseThinkingLevel,
+} from "../pi-extension/subagents/model-classifier.ts";
+import {
+  resolveChatModel,
+  resolveLaunchModelTarget,
+  resolveModelReference,
+} from "../pi-extension/subagents/model-registry.ts";
+import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -4085,5 +4107,1236 @@ describe("pi-command.ts", () => {
       assert.equal(paths[1], join(agentDir, "extensions", "pi-interactive-subagents", "config.json"));
       assert.equal(getAgentConfigDir({ PI_CODING_AGENT_DIR: agentDir }), agentDir);
     });
+  });
+});
+
+
+describe("model presets (config.json)", () => {
+  const emptyConfig = (): ModelPresetConfig => ({
+    presets: {},
+    defaultPreset: null,
+    classifierModel: null,
+    sources: [],
+  });
+
+  describe("config discovery and merge", () => {
+    it("orders the layers package < global < project", () => {
+      const paths = modelPresetConfigPaths({
+        cwd: "/repo",
+        agentDir: "/home/u/.pi/agent",
+        packageRoot: "/pkg",
+      });
+
+      assert.deepEqual(paths, [
+        "/pkg/config.json",
+        "/home/u/.pi/agent/extentions/pi-interactive-subagents/config.json",
+        "/home/u/.pi/agent/extensions/pi-interactive-subagents/config.json",
+        "/repo/.pi/extentions/pi-interactive-subagents/config.json",
+        "/repo/.pi/extensions/pi-interactive-subagents/config.json",
+      ]);
+    });
+
+    it("deep-merges nested objects and replaces scalars/arrays", () => {
+      const merged = mergeConfigObjects(
+        { nested: { keep: 1, override: 2 }, list: [1, 2], n: 1 },
+        { nested: { override: 3 }, list: [3], n: 2 },
+      );
+
+      assert.deepEqual(merged, {
+        nested: { keep: 1, override: 3 },
+        list: [3],
+        n: 2,
+      });
+    });
+
+    it("lets the project layer override the global layer field by field", () => {
+      withTempDir((dir) => {
+        const globalPath = join(dir, "global.json");
+        const projectPath = join(dir, "project.json");
+        writeFileSync(
+          globalPath,
+          JSON.stringify({
+            status: { enabled: true },
+            modelPresets: {
+              fast: { model: "global/haiku" },
+              smart: { model: "global/opus" },
+            },
+            defaultPreset: "fast",
+          }),
+        );
+        writeFileSync(
+          projectPath,
+          JSON.stringify({
+            modelPresets: { fast: { model: "project/haiku" } },
+            defaultPreset: "smart",
+          }),
+        );
+
+        const config = loadModelPresetConfig({ configPaths: [globalPath, projectPath] });
+
+        assert.deepEqual(config.presets, {
+          fast: { model: "project/haiku" },
+          smart: { model: "global/opus" },
+        });
+        assert.equal(config.defaultPreset, "smart");
+        assert.deepEqual(config.sources, [globalPath, projectPath]);
+      });
+    });
+
+    it("returns an empty config when no file exists", () => {
+      withTempDir((dir) => {
+        assert.deepEqual(loadModelPresetConfig({ configPaths: [join(dir, "missing.json")] }), emptyConfig());
+      });
+    });
+
+    it("rejects malformed JSON and non-object roots", () => {
+      withTempDir((dir) => {
+        const configPath = join(dir, "config.json");
+        writeFileSync(configPath, "{\n");
+        assert.throws(
+          () => readModelPresetConfigFile(configPath),
+          /Invalid JSON in subagent config .*config\.json/,
+        );
+
+        writeFileSync(configPath, JSON.stringify([1, 2]));
+        assert.throws(() => readModelPresetConfigFile(configPath), /root must be an object/);
+      });
+    });
+  });
+
+  describe("parseModelPresetConfig", () => {
+    it("accepts object and shorthand presets and ignores unrelated keys", () => {
+      const config = parseModelPresetConfig({
+        status: { enabled: true },
+        piBin: "pi",
+        modelPresets: {
+          fast: "anthropic/claude-haiku-4-5",
+          balance: { model: "anthropic/claude-sonnet-4-5" },
+          smart: { model: "anthropic/claude-opus-4-1", thinking: "high" },
+          quick: { model: "anthropic/claude-haiku-4-5", thinking: "decisions" },
+        },
+        defaultPreset: "balance",
+      });
+
+      assert.deepEqual(config.presets, {
+        fast: { model: "anthropic/claude-haiku-4-5" },
+        balance: { model: "anthropic/claude-sonnet-4-5" },
+        smart: { model: "anthropic/claude-opus-4-1", thinking: "high" },
+        quick: { model: "anthropic/claude-haiku-4-5", thinking: "decisions" },
+      });
+      assert.equal(config.defaultPreset, "balance");
+    });
+
+    it("rejects invalid presets and a dangling defaultPreset", () => {
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { Fast: "x" } }),
+        /must start with a lowercase letter/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { fast: {} } }),
+        /model must be a non-empty string/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { fast: { model: "m", level: 1 } } }),
+        /unsupported key\(s\): level/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { fast: { model: "m", thinking: "sometimes" } } }),
+        /thinking must be off, minimal, low, medium, high, xhigh, max or "decisions"/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { fast: "m" }, defaultPreset: "smart" }),
+        /defaultPreset "smart" is not defined/,
+      );
+      assert.throws(() => parseModelPresetConfig({ defaultPreset: 7 }), /defaultPreset must be a non-empty string/);
+    });
+
+    it("treats defaultPreset: null as unset", () => {
+      const config = parseModelPresetConfig({ modelPresets: { fast: "m" }, defaultPreset: null });
+      assert.equal(config.defaultPreset, null);
+    });
+  });
+
+  describe("resolveSubagentModel", () => {
+    const config: ModelPresetConfig = {
+      presets: {
+        fast: { model: "p/fast" },
+        balance: { model: "p/balance" },
+        smart: { model: "p/smart" },
+      },
+      defaultPreset: "balance",
+      classifierModel: null,
+      sources: [],
+    };
+
+    it("prefers the tool parameter, expanding it when it names a preset", () => {
+      assert.deepEqual(resolveSubagentModel({ config, paramModel: "lit/model", frontmatterModel: "smart" }), {
+        model: "lit/model",
+        source: "tool-param",
+        // The frontmatter still names a preset, so its thinking policy applies.
+        decideThinking: true,
+      });
+      assert.deepEqual(resolveSubagentModel({ config, paramModel: "smart" }), {
+        model: "p/smart",
+        source: "preset:smart",
+        preset: "smart",
+        decideThinking: true,
+      });
+    });
+
+    it("expands a frontmatter preset and keeps a literal frontmatter model intact", () => {
+      assert.deepEqual(resolveSubagentModel({ config, frontmatterModel: "fast" }), {
+        model: "p/fast",
+        source: "preset:fast",
+        preset: "fast",
+        decideThinking: true,
+      });
+      assert.deepEqual(resolveSubagentModel({ config, frontmatterModel: "anthropic/x" }), {
+        model: "anthropic/x",
+        source: "frontmatter",
+        // defaultPreset is active, so its thinking policy applies.
+        decideThinking: true,
+      });
+    });
+
+    it("passes the frontmatter thinking level through, independently of the preset", () => {
+      assert.deepEqual(resolveSubagentModel({ config, frontmatterModel: "smart", frontmatterThinking: "max" }), {
+        model: "p/smart",
+        thinking: "max",
+        source: "preset:smart",
+        preset: "smart",
+        decideThinking: false,
+      });
+      // A literal model keeps the frontmatter level and never picks one up from
+      // the default preset.
+      assert.deepEqual(
+        resolveSubagentModel({ config, frontmatterModel: "anthropic/x", frontmatterThinking: "low" }),
+        { model: "anthropic/x", thinking: "low", source: "frontmatter", decideThinking: false },
+      );
+    });
+
+    it("falls back to defaultPreset and then to the parent session", () => {
+      assert.deepEqual(resolveSubagentModel({ config }), {
+        model: "p/balance",
+        source: "default-preset:balance",
+        preset: "balance",
+        decideThinking: true,
+      });
+      assert.deepEqual(resolveSubagentModel({ config: emptyConfig() }), {
+        source: "unresolved",
+        decideThinking: true,
+      });
+      assert.deepEqual(resolveSubagentModel({ config: emptyConfig(), frontmatterThinking: "high" }), {
+        source: "unresolved",
+        thinking: "high",
+        decideThinking: false,
+      });
+    });
+
+    it("applies a preset's thinking policy, defaulting to decisions", () => {
+      const policies: ModelPresetConfig = {
+        presets: {
+          pinned: { model: "p/one", thinking: "high" },
+          defer: { model: "p/two", thinking: "decisions" },
+          unset: { model: "p/three" },
+        },
+        defaultPreset: null,
+        classifierModel: null,
+        sources: [],
+      };
+
+      assert.deepEqual(resolveSubagentModel({ config: policies, frontmatterModel: "pinned" }), {
+        model: "p/one",
+        source: "preset:pinned",
+        preset: "pinned",
+        thinking: "high",
+        decideThinking: false,
+      });
+      // "decisions" and an omitted `thinking` both defer to the classifier.
+      assert.deepEqual(resolveSubagentModel({ config: policies, frontmatterModel: "defer" }), {
+        model: "p/two",
+        source: "preset:defer",
+        preset: "defer",
+        decideThinking: true,
+      });
+      assert.deepEqual(resolveSubagentModel({ config: policies, frontmatterModel: "unset" }), {
+        model: "p/three",
+        source: "preset:unset",
+        preset: "unset",
+        decideThinking: true,
+      });
+      // An explicit pin still beats the preset's fixed level.
+      assert.deepEqual(
+        resolveSubagentModel({ config: policies, frontmatterModel: "pinned", frontmatterThinking: "low" }),
+        {
+          model: "p/one",
+          source: "preset:pinned",
+          preset: "pinned",
+          thinking: "low",
+          decideThinking: false,
+        },
+      );
+    });
+
+    it("warns when a canonical tier reaches pi as a literal model id", () => {
+      const fromFrontmatter = resolveSubagentModel({
+        config: emptyConfig(),
+        agentName: "worker",
+        frontmatterModel: "smart",
+      });
+      assert.match(fromFrontmatter.warning ?? "", /Agent "worker" selects model "smart"/);
+      assert.equal(fromFrontmatter.model, "smart");
+
+      const fromParam = resolveSubagentModel({ config: emptyConfig(), paramModel: "fast" });
+      assert.match(fromParam.warning ?? "", /model tool parameter/);
+
+      assert.equal(resolveSubagentModel({ config, frontmatterModel: "smart" }).warning, undefined);
+    });
+  });
+
+  describe("subagents_list badge", () => {
+    it("shows the resolved model for preset-backed agents", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const config: ModelPresetConfig = {
+        presets: { balance: { model: "p/balance" }, smart: { model: "p/smart" } },
+        defaultPreset: "balance",
+        classifierModel: null,
+        sources: [],
+      };
+
+      assert.equal(testApi.formatModelBadge("smart", config), "smart → p/smart");
+      assert.equal(testApi.formatModelBadge(undefined, config), "balance (default) → p/balance");
+      assert.equal(testApi.formatModelBadge("anthropic/x", config), "anthropic/x");
+      assert.equal(testApi.formatModelBadge(undefined, emptyConfig()), undefined);
+    });
+  });
+});
+
+
+describe("thinking level resolution", () => {
+  it("splits a valid :<level> suffix and leaves other colons alone", () => {
+    assert.deepEqual(splitThinkingSuffix("smart:high"), { base: "smart", thinking: "high" });
+    assert.deepEqual(splitThinkingSuffix(" anthropic/x:max "), { base: "anthropic/x", thinking: "max" });
+    assert.deepEqual(splitThinkingSuffix("openrouter/x:exacto"), {
+      base: "openrouter/x:exacto",
+      thinking: undefined,
+    });
+    assert.deepEqual(splitThinkingSuffix("smart:bogus"), { base: "smart:bogus", thinking: undefined });
+    assert.deepEqual(splitThinkingSuffix(":high"), { base: ":high", thinking: undefined });
+    assert.deepEqual(splitThinkingSuffix(undefined), { base: undefined, thinking: undefined });
+  });
+
+  it("reports the levels a model supports and clamps requests into that set", () => {
+    assert.deepEqual(supportedThinkingLevels(undefined), ["off"]);
+    assert.deepEqual(supportedThinkingLevels({ reasoning: false }), ["off"]);
+    // xhigh/max need an explicit mapping, exactly like pi's own resolver.
+    assert.deepEqual(supportedThinkingLevels({ reasoning: true }), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    assert.deepEqual(
+      supportedThinkingLevels({ reasoning: true, thinkingLevelMap: { xhigh: null, max: "max_tokens" } }),
+      ["off", "minimal", "low", "medium", "high", "max"],
+    );
+
+    const capped = { reasoning: true, thinkingLevelMap: { xhigh: null, max: null } };
+    assert.equal(clampThinkingLevel(capped, "max"), "high");
+    assert.equal(clampThinkingLevel(capped, "low"), "low");
+    assert.equal(clampThinkingLevel(capped, "bogus"), "off");
+    assert.equal(clampThinkingLevel(undefined, "high"), "off");
+    assert.equal(clampThinkingLevel({ reasoning: true }, undefined), "off");
+  });
+
+  it("resolves a preset with a :<level> suffix from the model parameter and frontmatter", () => {
+    const config: ModelPresetConfig = {
+      presets: { smart: { model: "p/smart" }, fast: { model: "p/fast" } },
+      defaultPreset: null,
+      classifierModel: null,
+      sources: [],
+    };
+
+    assert.deepEqual(resolveSubagentModel({ config, paramModel: "smart:high" }), {
+      model: "p/smart",
+      thinking: "high",
+      source: "preset:smart",
+      preset: "smart",
+      decideThinking: false,
+    });
+    // The parameter's level outranks frontmatter thinking; a literal model keeps
+    // the suffix it was given.
+    assert.deepEqual(
+      resolveSubagentModel({
+        config,
+        paramModel: "anthropic/x:low",
+        frontmatterThinking: "high",
+      }),
+      { model: "anthropic/x", thinking: "low", source: "tool-param", decideThinking: false },
+    );
+    assert.deepEqual(resolveSubagentModel({ config, frontmatterModel: "fast:max" }), {
+      model: "p/fast",
+      thinking: "max",
+      source: "preset:fast",
+      preset: "fast",
+      decideThinking: false,
+    });
+    assert.deepEqual(
+      resolveSubagentModel({ config, frontmatterModel: "fast:max", frontmatterThinking: "minimal" }),
+      { model: "p/fast", thinking: "minimal", source: "preset:fast", preset: "fast", decideThinking: false },
+    );
+  });
+
+  it("accepts preset descriptions and a configured classifier model", () => {
+    const config = parseModelPresetConfig({
+      modelPresets: {
+        smart: { model: "p/smart", description: "Hard design work" },
+        fast: "p/fast",
+      },
+      classifierModel: "typesafe/jev-latest",
+    });
+
+    assert.deepEqual(config.presets.smart, { model: "p/smart", description: "Hard design work" });
+    assert.deepEqual(config.presets.fast, { model: "p/fast" });
+    assert.equal(config.classifierModel, "typesafe/jev-latest");
+
+    assert.throws(
+      () => parseModelPresetConfig({ modelPresets: { fast: { model: "m", description: "  " } } }),
+      /description must be a non-empty string/,
+    );
+    assert.throws(
+      () => parseModelPresetConfig({ classifierModel: 42 }),
+      /classifierModel must be a non-empty/,
+    );
+  });
+});
+
+describe("subagent_choose_model classifier", () => {
+  const config: ModelPresetConfig = {
+    presets: {
+      fast: { model: "prov/haiku" },
+      balance: { model: "prov/sonnet" },
+      smart: { model: "prov/opus", description: "Hard design and debugging" },
+    },
+    defaultPreset: null,
+    classifierModel: null,
+    sources: [],
+  };
+
+  const chatModels = [
+    { provider: "prov", id: "haiku", reasoning: false },
+    { provider: "prov", id: "sonnet", reasoning: true },
+    { provider: "prov", id: "opus", reasoning: true, thinkingLevelMap: { xhigh: null, max: null } },
+  ];
+
+  function makeRegistry(options: {
+    classifier?: { provider: string; id: string };
+    available?: unknown[];
+    answers?: Record<string, unknown>;
+    stopReason?: string;
+    errorMessage?: string;
+    seen?: { model?: unknown; context?: any; options?: any };
+  }) {
+    const classifier = options.classifier ?? { provider: "typesafe", id: "jev-latest" };
+    return {
+      classify: async (model: unknown, context: unknown, opts: unknown) => {
+        if (options.seen) {
+          options.seen.model = model;
+          options.seen.context = context;
+          options.seen.options = opts;
+        }
+        return {
+          provider: classifier.provider,
+          model: classifier.id,
+          answers: options.answers ?? {},
+          stopReason: options.stopReason ?? "stop",
+          ...(options.errorMessage ? { errorMessage: options.errorMessage } : {}),
+        };
+      },
+      getModelOfType: (type: string, provider: string, id: string) => {
+        if (type === "classifier") {
+          return provider === classifier.provider && id === classifier.id ? classifier : undefined;
+        }
+        return chatModels.find((model) => model.provider === provider && model.id === id);
+      },
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifier] : chatModels),
+      getAvailableOfType: async () => options.available ?? [classifier],
+    } as any;
+  }
+
+  it("picks the highest-probability preset, offering only levels its models support", async () => {
+    const seen: { model?: unknown; context?: any; options?: any } = {};
+    const registry = makeRegistry({
+      seen,
+      answers: {
+        preset: {
+          type: "choice",
+          choice: "smart",
+          probabilities: { fast: 0.1, balance: 0.28, smart: 0.62 },
+          confidence: 0.62,
+        },
+        // "max" is not on offer (no candidate model supports it), so it is
+        // dropped and the next-best offered level wins.
+        thinking: {
+          type: "choice",
+          choice: "max",
+          probabilities: { low: 0.05, high: 0.4, max: 0.55 },
+          confidence: 0.55,
+        },
+      },
+    });
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config,
+      agentName: "worker",
+      agentDescription: "Implements tasks",
+      task: "Refactor the scheduler",
+    });
+
+    assert.equal(outcome.ok, true);
+    if (!outcome.ok) return;
+
+    assert.equal(outcome.choice.preset, "smart");
+    assert.equal(outcome.choice.model, "prov/opus");
+    assert.equal(outcome.choice.thinking, "high");
+    assert.equal(outcome.choice.thinkingClamped, false);
+    assert.equal(outcome.choice.modelParam, "smart:high");
+    assert.equal(outcome.choice.classifier.provider, "typesafe");
+    assert.deepEqual(outcome.choice.supportedThinkingLevels, ["off", "minimal", "low", "medium", "high"]);
+
+    const questions = seen.context.questions;
+    assert.equal(questions.preset.criteria.smart, "Hard design and debugging");
+    assert.equal(questions.preset.criteria.fast.length > 0, true);
+    // Union over the candidate models: prov/opus and prov/sonnet cap at high,
+    // prov/haiku does not reason at all — so xhigh/max are never asked about.
+    assert.deepEqual(Object.keys(questions.thinking.criteria), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    assert.deepEqual(seen.context.state, {
+      task: "Refactor the scheduler",
+      agent: "worker",
+      agentDescription: "Implements tasks",
+    });
+    assert.equal(seen.model, registry.getModelOfType("classifier", "typesafe", "jev-latest"));
+  });
+
+  it("asks no thinking question when no candidate model can reason", async () => {
+    const seen: { context?: any; called?: boolean } = {};
+    const registry = makeRegistry({
+      seen,
+      answers: { preset: { choice: "fast", probabilities: { fast: 1 } } },
+    });
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: { ...config, presets: { fast: { model: "prov/haiku" }, balance: { model: "prov/haiku" } } },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.ok ? outcome.choice.thinking : "x", undefined);
+    assert.equal(outcome.ok && outcome.choice.modelParam, "fast");
+    assert.deepEqual(Object.keys(seen.context.questions), ["preset"]);
+  });
+
+  it("decides without a classifier call when nothing is left to ask", async () => {
+    const classifierModel = { provider: "typesafe", id: "jev-latest" };
+    const maxOnly = {
+      provider: "prov",
+      id: "max-only",
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: null,
+        low: null,
+        medium: null,
+        high: null,
+        xhigh: null,
+        max: "effort",
+      },
+    };
+    const all = [...chatModels, maxOnly];
+    let called = false;
+    const registry = {
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifierModel] : all),
+      getModelOfType: (type: string, provider: string, id: string) =>
+        type === "classifier"
+          ? classifierModel
+          : all.find((model) => model.provider === provider && model.id === id),
+      getAvailableOfType: async () => [classifierModel],
+      classify: async () => {
+        called = true;
+        return { stopReason: "stop", answers: {} };
+      },
+    } as any;
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: { ...config, presets: { smart: { model: "prov/max-only" } } },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok && outcome.choice.thinking, "max");
+    assert.equal(outcome.ok && outcome.choice.modelParam, "smart:max");
+    assert.equal(called, false);
+  });
+
+  it("uses a preset's fixed thinking level without asking about it", async () => {
+    const seen: { context?: any } = {};
+    const registry = makeRegistry({
+      seen,
+      answers: { preset: { choice: "smart", probabilities: { fast: 0.1, smart: 0.9 } } },
+    });
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: {
+        ...config,
+        presets: {
+          fast: { model: "prov/haiku" },
+          smart: { model: "prov/opus", thinking: "medium" },
+        },
+      },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok && outcome.choice.preset, "smart");
+    assert.equal(outcome.ok && outcome.choice.thinking, "medium");
+    assert.equal(outcome.ok && outcome.choice.modelParam, "smart:medium");
+    assert.deepEqual(Object.keys(seen.context.questions), ["preset"]);
+  });
+
+  it("asks nothing when every preset pins its level", async () => {
+    const classifierModel = { provider: "typesafe", id: "jev-latest" };
+    let called = false;
+    const registry = {
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifierModel] : chatModels),
+      getModelOfType: (type: string, provider: string, id: string) =>
+        type === "classifier"
+          ? classifierModel
+          : chatModels.find((model) => model.provider === provider && model.id === id),
+      getAvailableOfType: async () => [classifierModel],
+      classify: async () => {
+        called = true;
+        return { stopReason: "stop", answers: {} };
+      },
+    } as any;
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: { ...config, presets: { only: { model: "prov/opus", thinking: "high" } } },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok && outcome.choice.thinking, "high");
+    assert.equal(outcome.ok && outcome.choice.modelParam, "only:high");
+    assert.equal(called, false);
+  });
+
+  it("uses the configured classifierModel and otherwise the first available one", async () => {
+    const registry = makeRegistry({
+      answers: { preset: { choice: "fast", probabilities: { fast: 1 } } },
+    });
+
+    const configured = await chooseSubagentModel({
+      registry,
+      config: { ...config, classifierModel: "typesafe/jev-latest" },
+      task: "t",
+    });
+    assert.equal(configured.ok && configured.choice.preset, "fast");
+    assert.equal(configured.ok && configured.choice.classifier.provider, "typesafe");
+
+    const missing = await chooseSubagentModel({
+      registry,
+      config: { ...config, classifierModel: "nope/missing" },
+      task: "t",
+    });
+    assert.equal(missing.ok, false);
+    assert.match(missing.ok ? "" : missing.error, /not a known classifier model/);
+    // The error names the classifier models that do exist, so a typo is fixable.
+    assert.match(missing.ok ? "" : missing.error, /Known classifier models: typesafe\/jev-latest/);
+
+    const other = { provider: "cloudflare", id: "clef" };
+    const firstAvailable = await chooseSubagentModel({
+      registry: makeRegistry({
+        classifier: other,
+        available: [other],
+        answers: { preset: { choice: "balance", probabilities: { balance: 1 } } },
+      }),
+      config,
+      task: "t",
+    });
+    assert.equal(firstAvailable.ok && firstAvailable.choice.classifier.provider, "cloudflare");
+  });
+
+  it("asks only the thinking question when a single preset is configured", async () => {
+    const seen: { context?: any } = {};
+    const registry = makeRegistry({
+      seen,
+      answers: { thinking: { choice: "medium", probabilities: { medium: 1 } } },
+    });
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: { ...config, presets: { only: { model: "prov/sonnet" } } },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok && outcome.choice.preset, "only");
+    assert.deepEqual(Object.keys(seen.context.questions), ["thinking"]);
+    assert.equal(outcome.ok && outcome.choice.modelParam, "only:medium");
+  });
+
+  it("keeps the classified level when the preset model is not in the catalog", async () => {
+    const registry = makeRegistry({
+      answers: {
+        preset: { choice: "fast", probabilities: { fast: 1 } },
+        thinking: { choice: "high", probabilities: { high: 1 } },
+      },
+    });
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: { ...config, presets: { fast: { model: "ghost/model" } } },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok && outcome.choice.thinking, "high");
+    assert.equal(outcome.ok && outcome.choice.modelResolved, false);
+    assert.equal(outcome.ok && outcome.choice.thinkingClamped, false);
+    assert.equal(outcome.ok && outcome.choice.modelParam, "fast:high");
+    assert.equal(outcome.ok && outcome.choice.supportedThinkingLevels, undefined);
+  });
+
+  it("reports classifier and configuration failures instead of guessing", async () => {
+    const noPresets = await chooseSubagentModel({
+      registry: makeRegistry({}),
+      config: { presets: {}, defaultPreset: null, classifierModel: null, sources: [] },
+      task: "t",
+    });
+    assert.equal(noPresets.ok, false);
+    assert.match(noPresets.ok ? "" : noPresets.error, /No modelPresets are configured/);
+
+    const noClassifier = await chooseSubagentModel({
+      registry: { classify: async () => ({}) } as any,
+      config,
+      task: "t",
+    });
+    assert.equal(noClassifier.ok, false);
+    assert.match(noClassifier.ok ? "" : noClassifier.error, /No classifier model is available/);
+
+    const failed = await chooseSubagentModel({
+      registry: makeRegistry({ stopReason: "error", errorMessage: "gateway timeout" }),
+      config,
+      task: "t",
+    });
+    assert.equal(failed.ok, false);
+    assert.match(failed.ok ? "" : failed.error, /gateway timeout/);
+
+    const unusable = await chooseSubagentModel({
+      registry: makeRegistry({
+        answers: { preset: { type: "choice", choice: "nope", probabilities: { nope: 1 } } },
+      }),
+      config,
+      task: "t",
+    });
+    assert.equal(unusable.ok, false);
+    assert.match(unusable.ok ? "" : unusable.error, /no usable preset answer/);
+  });
+
+  it("uses the built-in tier descriptions and lets a config description override them", async () => {
+    const seenBuiltIn: { context?: any } = {};
+    await chooseSubagentModel({
+      registry: makeRegistry({
+        seen: seenBuiltIn,
+        answers: { preset: { choice: "fast", probabilities: { fast: 1 } } },
+      }),
+      config,
+      task: "t",
+    });
+
+    const criteria = seenBuiltIn.context.questions.preset.criteria;
+    assert.match(criteria.fast, /reconnaissance/);
+    assert.match(criteria.balance, /Everyday implementation/);
+    // The fixture's smart preset carries its own description, which wins.
+    assert.equal(criteria.smart, "Hard design and debugging");
+
+    const seenOverride: { context?: any } = {};
+    await chooseSubagentModel({
+      registry: makeRegistry({
+        seen: seenOverride,
+        answers: { preset: { choice: "fast", probabilities: { fast: 1 } } },
+      }),
+      config: {
+        ...config,
+        presets: { ...config.presets, fast: { model: "prov/haiku", description: "只做机械改动" } },
+      },
+      task: "t",
+    });
+
+    assert.equal(seenOverride.context.questions.preset.criteria.fast, "只做机械改动");
+  });
+
+  it("registers subagent_choose_model as a spawning tool", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    const tool = registeredTools.find((entry) => entry.name === "subagent_choose_model");
+    assert.ok(tool, "expected subagent_choose_model to be registered");
+    assert.match(tool.description, /modelPresets/);
+    assert.match(tool.promptSnippet, /subagent/);
+    assert.equal(
+      (subagentsModule as any).__test__.resolveDenyTools({ spawning: false }).has("subagent_choose_model"),
+      true,
+    );
+  });
+
+  it("guides the spawn tool to subagent_choose_model", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    const spawnTool = registeredTools.find((entry) => entry.name === "subagent");
+    assert.match(spawnTool.description, /call subagent_choose_model first/);
+    assert.match(spawnTool.promptSnippet, /call subagent_choose_model first/);
+    assert.equal(spawnTool.promptGuidelines.length, 2);
+    assert.match(spawnTool.promptGuidelines[0], /modelParam/);
+    assert.match(spawnTool.promptGuidelines[1], /never call it in a loop|do not call subagent_choose_model in a loop/);
+  });
+
+  it("drops the choose-model guidance when the tool is denied", () => {
+    const previous = process.env.PI_DENY_TOOLS;
+    process.env.PI_DENY_TOOLS = "subagent_choose_model";
+
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      assert.equal(registeredTools.some((entry) => entry.name === "subagent_choose_model"), false);
+
+      const spawnTool = registeredTools.find((entry) => entry.name === "subagent");
+      assert.doesNotMatch(spawnTool.description, /subagent_choose_model/);
+      assert.doesNotMatch(spawnTool.promptSnippet, /subagent_choose_model/);
+      assert.deepEqual(spawnTool.promptGuidelines, []);
+    } finally {
+      if (previous === undefined) delete process.env.PI_DENY_TOOLS;
+      else process.env.PI_DENY_TOOLS = previous;
+    }
+  });
+
+  it("runs end to end through the registered tool with a project config", async () => {
+    await withTempDirAsync(async (dir) => {
+      const configDir = join(dir, ".pi", "extensions", "pi-interactive-subagents");
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(
+        join(configDir, "config.json"),
+        JSON.stringify({
+          modelPresets: { fast: { model: "prov/haiku" }, smart: { model: "prov/opus" } },
+          classifierModel: "typesafe/jev-latest",
+        }),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((entry) => entry.name === "subagent_choose_model");
+
+      const result = await tool.execute("call-1", { task: "Hard refactor" }, undefined, undefined, {
+        cwd: dir,
+        modelRegistry: makeRegistry({
+          answers: {
+            preset: { type: "choice", choice: "smart", probabilities: { fast: 0.2, smart: 0.8 } },
+            thinking: { type: "choice", choice: "high", probabilities: { high: 1 } },
+          },
+        }),
+      });
+
+      assert.match(result.content[0].text, /model: "smart:high"/);
+      assert.match(result.content[0].text, /Model thinking levels: off, minimal, low, medium, high/);
+      assert.equal(result.details.preset, "smart");
+      assert.equal(result.details.modelParam, "smart:high");
+      assert.equal(result.details.thinking, "high");
+      assert.equal(result.details.classifier.modelId, "jev-latest");
+    });
+  });
+});
+
+
+describe("model reference resolution", () => {
+  const models = [
+    { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+    { provider: "anthropic", id: "claude-sonnet-4-5-20250929" },
+    { provider: "anthropic", id: "claude-opus-4-1" },
+    { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+    { provider: "openrouter", id: "openai/gpt-4o:extended" },
+  ];
+  const registry = (available = models, all = models) => ({
+    getAvailable: () => available,
+    getAll: () => all,
+  });
+
+  it("resolves provider/id, bare ids, partial names and slashed ids", () => {
+    assert.deepEqual(resolveModelReference(registry(), "anthropic/claude-opus-4-1"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "anthropic", id: "claude-opus-4-1" },
+    });
+    assert.deepEqual(resolveModelReference(registry(), "claude-opus-4-1"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "anthropic", id: "claude-opus-4-1" },
+    });
+    // "sonnet" matches the alias and the dated version; the alias wins.
+    assert.deepEqual(resolveModelReference(registry(), "sonnet"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+    });
+    // An id that merely looks like provider/id still resolves as a raw id.
+    assert.deepEqual(resolveModelReference(registry(), "openai/gpt-4o:extended"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "openrouter", id: "openai/gpt-4o:extended" },
+    });
+    // A short id under a real provider resolves like pi's own --model does,
+    // preferring the alias over the dated version inside that provider.
+    assert.deepEqual(resolveModelReference(registry(), "openrouter/gpt-4o:extended"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "openrouter", id: "openai/gpt-4o:extended" },
+    });
+    assert.deepEqual(resolveModelReference(registry(), "anthropic/sonnet"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+    });
+  });
+
+  it("resolves a model id that itself contains slashes", () => {
+    // provider = first segment, modelId = the rest.
+    const nested = [
+      { provider: "cpa", id: "my/gpt-6.1-sol", reasoning: true, thinkingLevelMap: { xhigh: null, max: null } },
+      { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+    ];
+
+    assert.deepEqual(resolveModelReference(registry(nested, nested), "cpa/my/gpt-6.1-sol"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "cpa", id: "my/gpt-6.1-sol" },
+    });
+    // The bare id (first segment is part of the id, not a provider) still works.
+    assert.deepEqual(resolveModelReference(registry(nested, nested), "my/gpt-6.1-sol"), {
+      ok: true,
+      resolved: true,
+      model: { provider: "cpa", id: "my/gpt-6.1-sol" },
+    });
+
+    // The clamp/level lookup finds the same model, so thinking is restricted to
+    // what it supports instead of falling back to every level.
+    assert.equal(resolveChatModel(registry(nested, nested), "cpa/my/gpt-6.1-sol")?.id, "my/gpt-6.1-sol");
+    assert.equal(resolveChatModel(registry(nested, nested), "my/gpt-6.1-sol")?.id, "my/gpt-6.1-sol");
+  });
+
+  it("keeps a nested model id intact through a thinking suffix", () => {
+    const config: ModelPresetConfig = {
+      presets: { smart: { model: "cpa/my/gpt-6.1-sol" } },
+      defaultPreset: null,
+      classifierModel: null,
+      sources: [],
+    };
+
+    // Preset model: passed through as configured.
+    assert.deepEqual(resolveSubagentModel({ config, paramModel: "smart" }), {
+      model: "cpa/my/gpt-6.1-sol",
+      source: "preset:smart",
+      preset: "smart",
+      decideThinking: true,
+    });
+    // Literal reference with a level suffix: the suffix is stripped, the id kept.
+    const resolved = resolveSubagentModel({
+      config: { ...config, presets: {} },
+      paramModel: "cpa/my/gpt-6.1-sol:high",
+    });
+    assert.equal(resolved.model, "cpa/my/gpt-6.1-sol");
+    assert.equal(resolved.thinking, "high");
+    assert.deepEqual(resolveLaunchModelTarget(resolved, registry([{ provider: "cpa", id: "my/gpt-6.1-sol" }])), {
+      ok: true,
+      target: { provider: "cpa", id: "my/gpt-6.1-sol" },
+    });
+  });
+
+  it("reports ambiguity and unknown references instead of guessing", () => {
+    const shared = [
+      { provider: "a", id: "shared-model" },
+      { provider: "b", id: "shared-model" },
+    ];
+    const ambiguous = resolveModelReference(registry(shared, shared), "shared-model");
+    assert.equal(ambiguous.ok, false);
+    assert.match(
+      ambiguous.ok ? "" : ambiguous.error,
+      /ambiguous across providers: a\/shared-model, b\/shared-model/,
+    );
+
+    const unknown = resolveModelReference(registry(), "nope/nothing");
+    assert.equal(unknown.ok, false);
+    assert.match(unknown.ok ? "" : unknown.error, /not in the model catalog/);
+  });
+
+  it("distinguishes 'in the catalog but not authenticated'", () => {
+    const unauthenticated = [{ provider: "anthropic", id: "claude-opus-4-1" }];
+    const result = resolveModelReference(
+      { getAvailable: () => [], getAll: () => unauthenticated },
+      "anthropic/claude-opus-4-1",
+    );
+
+    assert.equal(result.ok, false);
+    assert.match(result.ok ? "" : result.error, /no working credentials/);
+  });
+
+  it("passes the reference through when the registry cannot list models", () => {
+    assert.deepEqual(resolveModelReference(undefined, "anthropic/x"), {
+      ok: true,
+      resolved: false,
+      model: { id: "anthropic/x" },
+    });
+    assert.deepEqual(resolveModelReference({ find: () => undefined }, "anthropic/x"), {
+      ok: true,
+      resolved: false,
+      model: { id: "anthropic/x" },
+    });
+  });
+
+  it("resolves launch targets for literal models and passes presets through", () => {
+    assert.deepEqual(resolveLaunchModelTarget({ source: "tool-param", model: "sonnet" }, registry()), {
+      ok: true,
+      target: { provider: "anthropic", id: "claude-sonnet-4-5" },
+    });
+    assert.deepEqual(
+      resolveLaunchModelTarget({ source: "preset:smart", model: "anthropic/claude-opus-4-1" }, registry()),
+      { ok: true, target: { id: "anthropic/claude-opus-4-1" } },
+    );
+    assert.deepEqual(resolveLaunchModelTarget({ source: "unresolved" }, registry()), { ok: true });
+
+    const failed = resolveLaunchModelTarget({ source: "tool-param", model: "nope/nothing" }, registry());
+    assert.equal(failed.ok, false);
+    assert.match(failed.ok ? "" : failed.error, /not in the model catalog/);
+  });
+
+  it("splits the thinking suffix before resolving a literal reference", () => {
+    const config: ModelPresetConfig = {
+      presets: { smart: { model: "anthropic/claude-opus-4-1" } },
+      defaultPreset: null,
+      classifierModel: null,
+      sources: [],
+    };
+
+    const resolved = resolveSubagentModel({ config, paramModel: "sonnet:high" });
+    assert.equal(resolved.thinking, "high");
+    assert.deepEqual(resolveLaunchModelTarget(resolved, registry()), {
+      ok: true,
+      target: { provider: "anthropic", id: "claude-sonnet-4-5" },
+    });
+  });
+});
+
+
+describe("inherited-model thinking selection", () => {
+  const config: ModelPresetConfig = {
+    presets: {},
+    defaultPreset: null,
+    classifierModel: null,
+    sources: [],
+  };
+
+  const models = [
+    { provider: "prov", id: "opus", reasoning: true, thinkingLevelMap: { xhigh: null, max: null } },
+    { provider: "prov", id: "haiku", reasoning: false },
+  ];
+  const classifier = { provider: "typesafe", id: "jev-latest" };
+
+  function makeRegistry(options: {
+    answers?: Record<string, unknown>;
+    stopReason?: string;
+    errorMessage?: string;
+    available?: unknown[];
+    seen?: { context?: any; called?: boolean };
+  }) {
+    return {
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifier] : models),
+      getAvailableOfType: async () => options.available ?? [classifier],
+      classify: async (_model: unknown, context: unknown) => {
+        if (options.seen) {
+          options.seen.called = true;
+          options.seen.context = context;
+        }
+        return {
+          stopReason: options.stopReason ?? "stop",
+          answers: options.answers ?? {},
+          ...(options.errorMessage ? { errorMessage: options.errorMessage } : {}),
+        };
+      },
+    } as any;
+  }
+
+  it("asks only for the levels the inherited model supports", async () => {
+    const seen: { context?: any; called?: boolean } = {};
+    const outcome = await chooseThinkingLevel({
+      registry: makeRegistry({
+        seen,
+        answers: {
+          // "max" is not offered for prov/opus, so it is filtered out and the
+          // remaining offered level wins.
+          thinking: { type: "choice", choice: "max", probabilities: { high: 0.4, max: 0.6 }, confidence: 0.6 },
+        },
+      }),
+      config,
+      agentName: "worker",
+      task: "Refactor the scheduler",
+      model: { provider: "prov", id: "opus" },
+    });
+
+    assert.equal(outcome.ok, true);
+    if (!outcome.ok) return;
+
+    assert.equal(outcome.thinking, "high");
+    assert.deepEqual(outcome.supportedThinkingLevels, ["off", "minimal", "low", "medium", "high"]);
+    assert.equal(outcome.classifier?.modelId, "jev-latest");
+
+    // Only the thinking question is asked, restricted to the model's levels,
+    // and the model is part of the state.
+    assert.deepEqual(Object.keys(seen.context.questions), ["thinking"]);
+    assert.deepEqual(Object.keys(seen.context.questions.thinking.criteria), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    assert.deepEqual(seen.context.state, {
+      task: "Refactor the scheduler",
+      agent: "worker",
+      model: "prov/opus",
+    });
+  });
+
+  it("offers every level when the inherited model is not in the catalog", async () => {
+    const seen: { context?: any } = {};
+    const outcome = await chooseThinkingLevel({
+      registry: makeRegistry({
+        seen,
+        answers: { thinking: { choice: "max", probabilities: { max: 1 } } },
+      }),
+      config,
+      task: "t",
+      model: { provider: "ghost", id: "model" },
+    });
+
+    assert.equal(outcome.ok && outcome.thinking, "max");
+    assert.equal(outcome.ok && outcome.supportedThinkingLevels, undefined);
+    assert.deepEqual(Object.keys(seen.context.questions.thinking.criteria), [...THINKING_LEVELS]);
+  });
+
+  it("resolves an unambiguous short model id before restricting the levels", async () => {
+    // Real-world shape: the catalog id carries a prefix (`mybitx/gpt-6.1-sol`)
+    // while configs often write the short form, and the model only supports
+    // low/high/max.
+    const prefixed = {
+      provider: "prov",
+      id: "mybitx/gpt-6.1-sol",
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
+    };
+    const seen: { context?: any } = {};
+    const outcome = await chooseThinkingLevel({
+      registry: {
+        getModelsOfType: (type: string) => (type === "classifier" ? [classifier] : [...models, prefixed]),
+        getAvailableOfType: async () => [classifier],
+        classify: async (_model: unknown, context: unknown) => {
+          seen.context = context;
+          return { stopReason: "stop", answers: { thinking: { choice: "high", probabilities: { high: 1 } } } };
+        },
+      } as any,
+      config,
+      task: "t",
+      model: { provider: "prov", id: "gpt-6.1-sol" },
+    });
+
+    assert.deepEqual(Object.keys(seen.context.questions.thinking.criteria), ["low", "high", "max"]);
+    assert.equal(outcome.ok && outcome.thinking, "high");
+    assert.deepEqual(outcome.ok ? outcome.supportedThinkingLevels : undefined, ["low", "high", "max"]);
+  });
+
+  it("takes a model's only supported level without a classifier call", async () => {
+    const seen: { context?: any; called?: boolean } = {};
+    const maxOnly = { provider: "prov", id: "max-only", reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: "effort" } };
+    const outcome = await chooseThinkingLevel({
+      registry: {
+        getModelsOfType: (type: string) => (type === "classifier" ? [classifier] : [...models, maxOnly]),
+        getAvailableOfType: async () => [classifier],
+        classify: async () => {
+          seen.called = true;
+          return { stopReason: "stop", answers: {} };
+        },
+      } as any,
+      config,
+      task: "t",
+      model: { provider: "prov", id: "max-only" },
+    });
+
+    assert.equal(outcome.ok && outcome.thinking, "max");
+    assert.deepEqual(outcome.ok ? outcome.supportedThinkingLevels : undefined, ["max"]);
+    assert.equal(seen.called, undefined);
+  });
+
+  it("skips the classifier call when the model has no extended reasoning", async () => {
+    const seen: { context?: any; called?: boolean } = {};
+    const outcome = await chooseThinkingLevel({
+      registry: makeRegistry({ seen }),
+      config,
+      task: "t",
+      model: { provider: "prov", id: "haiku" },
+    });
+
+    assert.equal(outcome.ok, true);
+    assert.equal(outcome.ok ? outcome.thinking : "x", undefined);
+    assert.equal(outcome.ok ? outcome.skipped : undefined, "model-has-no-reasoning");
+    assert.equal(seen.called, undefined);
+  });
+
+  it("reports failures so the caller can spawn without a thinking level", async () => {
+    const noClassifier = await chooseThinkingLevel({
+      registry: { getModelsOfType: () => models, classify: async () => ({}) } as any,
+      config,
+      task: "t",
+      model: { provider: "prov", id: "opus" },
+    });
+    assert.equal(noClassifier.ok, false);
+    assert.match(noClassifier.ok ? "" : noClassifier.error, /No classifier model is available/);
+
+    const failed = await chooseThinkingLevel({
+      registry: makeRegistry({ stopReason: "error", errorMessage: "gateway timeout" }),
+      config,
+      task: "t",
+      model: { provider: "prov", id: "opus" },
+    });
+    assert.equal(failed.ok, false);
+    assert.match(failed.ok ? "" : failed.error, /gateway timeout/);
+
+    const unusable = await chooseThinkingLevel({
+      registry: makeRegistry({
+        answers: { thinking: { type: "choice", choice: "nope", probabilities: { nope: 1 } } },
+      }),
+      config,
+      task: "t",
+      model: { provider: "prov", id: "opus" },
+    });
+    assert.equal(unusable.ok, false);
+    assert.match(unusable.ok ? "" : unusable.error, /no usable thinking answer/);
   });
 });

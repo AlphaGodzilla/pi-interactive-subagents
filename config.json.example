@@ -2,5 +2,11 @@
   "status": {
     "enabled": true
   },
-  "piBin": "pi"
+  "piBin": "pi",
+  "modelPresets": {
+    "fast": { "model": "anthropic/claude-haiku-4-5", "thinking": "low" },
+    "balance": { "model": "anthropic/claude-sonnet-4-5", "thinking": "decisions" },
+    "smart": { "model": "anthropic/claude-opus-4-1" }
+  },
+  "classifierModel": "typesafe/jev-latest"
 }

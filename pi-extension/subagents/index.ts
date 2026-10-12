@@ -59,6 +59,16 @@ import {
 } from "./status.ts";
 import { DEFAULT_PI_COMMAND, getAgentConfigDir, resolvePiCommand } from "./pi-command.ts";
 import {
+  loadModelPresetConfig,
+  resolveSubagentModel,
+  type ModelPresetConfig,
+} from "./model-presets.ts";
+import {
+  chooseSubagentModel,
+  chooseThinkingLevel,
+} from "./model-classifier.ts";
+import { resolveLaunchModelTarget, type ModelRegistryLike } from "./model-registry.ts";
+import {
   getSubagentActivityFile,
   readSubagentActivityFile,
   type ActivityReadResult,
@@ -131,7 +141,12 @@ const SubagentParams = Type.Object({
   systemPrompt: Type.Optional(
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Model override (overrides agent default). A value that names a configured `modelPresets` entry (e.g. \"smart\") selects that preset; any other value is a literal model reference (provider/modelId, bare id, or a partial name like \"sonnet\") resolved against the model catalog before launch. An optional `:<thinking>` suffix sets the level, e.g. \"smart:high\" (what subagent_choose_model returns).",
+    }),
+  ),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -221,6 +236,7 @@ const SPAWNING_TOOLS = new Set([
   "subagent",
   "subagent_interrupt",
   "subagents_list",
+  "subagent_choose_model",
   "subagent_resume",
   "subagent_steer",
   "subagent_cleanup",
@@ -478,7 +494,7 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
+function loadAgentDefaults(agentName: string): AgentDefinition | null {
   const configDir = getAgentConfigDir();
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
@@ -493,6 +509,34 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   }
 
   return null;
+}
+
+/**
+ * Badge shown by `subagents_list`: the configured preset and the model it
+ * resolves to (`smart → anthropic/claude-opus-4-1`), or the literal model.
+ */
+function formatModelBadge(model: string | undefined, config: ModelPresetConfig): string | undefined {
+  const resolved = resolveSubagentModel({ config, frontmatterModel: model });
+  if (!resolved.model) return undefined;
+  if (resolved.source.startsWith("preset:") && resolved.preset) {
+    return `${resolved.preset} → ${resolved.model}`;
+  }
+  if (resolved.source.startsWith("default-preset:") && resolved.preset) {
+    return `${resolved.preset} (default) → ${resolved.model}`;
+  }
+  return resolved.model;
+}
+
+/** ` (p=0.62)` for the picked label, when the classifier reported probabilities. */
+function formatProbability(probabilities: Record<string, number> | undefined, label: string): string {
+  const value = probabilities?.[label];
+  return typeof value === "number" ? ` (p=${value.toFixed(2)})` : "";
+}
+
+/** First text block of a tool result, for renderers that only show the text. */
+function resultText(result: { content: readonly unknown[] }): string {
+  const part = result.content[0] as { text?: unknown } | undefined;
+  return typeof part?.text === "string" ? part.text : "";
 }
 
 function formatElapsed(seconds: number): string {
@@ -1692,6 +1736,7 @@ export const __test__ = {
   getModuleAbortSignal,
   runningSubagents,
   formatElapsed,
+  formatModelBadge,
 };
 
 function startWidgetRefresh() {
@@ -1711,17 +1756,42 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: { getSessionFile(): string | undefined; getSessionId(): string; getSessionDir(): string };
+    cwd: string;
+    /** Used to resolve literal `model` strings into a concrete provider/model pair. */
+    modelRegistry?: ModelRegistryLike;
+  },
   options?: { surface?: string; worktree?: HerdrWorktreeContext },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+
+  // Model + thinking level for this spawn. `modelPresets` from config.json
+  // applies when neither the tool parameter nor the agent frontmatter pins a
+  // model; the project layer (<cwd>/.pi/extensions/pi-interactive-subagents/
+  // config.json) is deep-merged over the global one.
+  //
+  // Claude Code agents keep their own default model: the `defaultPreset` tier
+  // is a pi-model target and must not retarget a `claude` CLI spawn. An
+  // explicit frontmatter preset reference still applies.
+  const modelPresets = loadModelPresetConfig({ cwd: ctx.cwd ?? process.cwd() });
+  const effectivePresets =
+    agentDefs?.cli === "claude" ? { ...modelPresets, defaultPreset: null } : modelPresets;
+  const resolvedModel = resolveSubagentModel({
+    config: effectivePresets,
+    agentName: params.agent,
+    paramModel: params.model,
+    frontmatterModel: agentDefs?.model,
+    frontmatterThinking: agentDefs?.thinking,
+  });
+  if (resolvedModel.warning) throw new Error(resolvedModel.warning);
+  const effectiveModel = resolvedModel.model;
+  const effectiveThinking = resolvedModel.thinking;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1905,25 +1975,65 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
+  // A model named literally (tool parameter or frontmatter) is resolved against
+  // the model catalog first, so the child receives an explicit provider/model
+  // pair instead of dying on "No models match pattern". Preset models pass
+  // through as configured.
+  const launchModel = resolveLaunchModelTarget(resolvedModel, ctx.modelRegistry);
+  if (!launchModel.ok) throw new Error(launchModel.error);
+
+  // The model the child actually runs on: the preset/literal target, or the
+  // parent session's model when nothing pinned one. The thinking decision (and
+  // the levels it may offer) is resolved against this model.
+  let childModel: { provider?: string; id: string } | undefined = launchModel.target;
+
+  if (launchModel.target) {
+    if (launchModel.target.provider) {
+      parts.push("--provider", shellEscape(launchModel.target.provider));
+    }
+    parts.push("--model", shellEscape(launchModel.target.id));
   } else {
-    // No explicit model (tool param / agent frontmatter): inherit the parent
-    // session's current model. Without this, pi falls back to its CLI default
-    // provider ("google") — unauthenticated on proxy-only setups — and the
-    // child dies instantly with exit code 1 before writing any session output.
+    // No explicit model (no tool param / frontmatter model / modelPresets):
+    // inherit the parent session's current model. Without this, pi falls back
+    // to its CLI default provider ("google") — unauthenticated on proxy-only
+    // setups — and the child dies instantly with exit code 1 before writing any
+    // session output. Explicitly inheriting the parent's provider + model makes
+    // every launch deterministic.
     const parentModel = resolveParentModel(sessionFile);
     if (parentModel) {
       parts.push("--provider", shellEscape(parentModel.provider));
       parts.push("--model", shellEscape(parentModel.modelId));
+      childModel = { provider: parentModel.provider, id: parentModel.modelId };
     } else {
       throw new Error(
         `No model resolvable for subagent "${params.name}" ` +
-        "(no --model / agent frontmatter model / parent model_change). Set a model on " +
-        "the agent frontmatter (agents/<agent>.md), pass the model tool parameter, " +
-        "or run the parent session with a model.",
+        "(no --model / agent frontmatter model / modelPresets default / parent model_change). " +
+        "Set a model on the agent frontmatter (agents/<agent>.md), pass the model tool parameter, " +
+        "configure modelPresets (config.json), or run the parent session with a model.",
       );
+    }
+  }
+
+  // Thinking level travels as its own flag: pi warns and ignores an unknown
+  // level, while an unknown ":level" suffix would make --model unresolvable.
+  if (effectiveThinking) {
+    parts.push("--thinking", shellEscape(effectiveThinking));
+  } else if (resolvedModel.decideThinking && childModel) {
+    // Nothing pinned a level (the active preset says "decisions", or the model
+    // is inherited): let the classifier pick one from the task, restricted to
+    // what the child's model supports. A missing/unavailable classifier, or a
+    // model without extended reasoning, simply leaves the flag off — spawning
+    // never depends on it.
+    const picked = await chooseThinkingLevel({
+      registry: ctx.modelRegistry,
+      config: modelPresets,
+      agentName: params.agent,
+      agentDescription: agentDefs?.description,
+      task: params.task,
+      model: childModel,
+    });
+    if (picked.ok && picked.thinking) {
+      parts.push("--thinking", shellEscape(picked.thinking));
     }
   }
 
@@ -2280,6 +2390,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
+  // Model-choice guidance points at subagent_choose_model only when that tool is
+  // actually registered in this session — `spawning: false` and a
+  // `deny-tools: subagent_choose_model` both remove it.
+  const chooseModelGuidance = shouldRegister("subagent_choose_model")
+    ? {
+        description:
+          " When you are unsure which model tier or thinking level a spawn should use, call subagent_choose_model first and pass its returned `modelParam` (e.g. `\"smart:high\"`) as this tool's `model` parameter — do not guess a modelPresets tier yourself.",
+        snippet:
+          " When the model tier/thinking level is not obvious, call subagent_choose_model first and pass its returned `modelParam` (e.g. \"smart:high\") as `model`.",
+        guidelines: [
+          "Before spawning, call subagent_choose_model when the right model tier or thinking level is not obvious, then pass its returned `modelParam` — e.g. \"smart:high\" — as the `model` parameter of the `subagent` tool. It accounts for the task's difficulty and clamps the thinking level to what the chosen preset's model supports.",
+          "Do not invent modelPresets tiers or thinking levels yourself, and do not call subagent_choose_model in a loop: one call per spawn that needs a decision (it costs a classifier call).",
+        ],
+      }
+    : { description: "", snippet: "", guidelines: [] as string[] };
+
   // ── subagent tool ──
   if (shouldRegister("subagent"))
     pi.registerTool({
@@ -2293,10 +2419,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
         "The launch acknowledgement shows the subagent's internal id, e.g. `Sub-agent \"Worker\" [id a1b2c3d4] launched` — " +
-        "keep that id in mind if you may need to interrupt (subagent_interrupt) or steer (subagent_steer) it later.",
+        "keep that id in mind if you may need to interrupt (subagent_interrupt) or steer (subagent_steer) it later." +
+        chooseModelGuidance.description,
       promptSnippet:
         "Spawn a background sub-agent in a mux pane (async, fire-and-forget: results arrive automatically — never poll the run; query subagents_status only if the user asks). " +
-        "Keep the returned id — `Sub-agent \"Name\" [id a1b2c3d4] launched` — to interrupt (subagent_interrupt) or steer (subagent_steer) it later.",
+        "Keep the returned id — `Sub-agent \"Name\" [id a1b2c3d4] launched` — to interrupt (subagent_interrupt) or steer (subagent_steer) it later." +
+        chooseModelGuidance.snippet,
+      promptGuidelines: chooseModelGuidance.guidelines,
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2750,7 +2879,121 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_choose_model tool ──
+  if (shouldRegister("subagent_choose_model"))
+    pi.registerTool({
+      name: "subagent_choose_model",
+      label: "Choose Subagent Model",
+      description:
+        "Ask a classifier model which model tier and thinking level a subagent you are about to spawn should use. " +
+        "Tiers come from `modelPresets` in config.json (fast/balance/smart, ...); a preset that pins its own `thinking` uses it as is, otherwise the classifier picks the level (clamped to what the chosen tier's model actually supports). " +
+        "Returns the ready-to-use value — e.g. `smart:high` — to pass as the `model` parameter of the `subagent` tool, which then selects the smart preset with thinking level high. " +
+        "Costs one classifier call; use it when the model choice is not obvious, then spawn with the returned value. " +
+        "It does NOT spawn anything and does not pick the task's content.",
+      promptSnippet:
+        "Pick a `modelPresets` tier + thinking level for a subagent via a classifier model; returns the `model: \"<preset>:<thinking>\"` value to pass to `subagent`.",
+      promptGuidelines: [
+        "Call subagent_choose_model when the right model tier/thinking level for a spawn is not obvious, then pass its returned `modelParam` (e.g. \"smart:high\") as the `model` parameter of the `subagent` tool.",
+        "subagent_choose_model needs `modelPresets` in config.json and a classifier model (configured `classifierModel`, else the first available one). It costs one classifier call — never call it in a loop.",
+      ],
+      parameters: Type.Object({
+        task: Type.String({
+          description: "The task/prompt you intend to give the subagent. This text is what the classifier judges.",
+        }),
+        agent: Type.Optional(
+          Type.String({
+            description:
+              "Agent template you plan to spawn (e.g. \"worker\"); its description is passed to the classifier for context.",
+          }),
+        ),
+      }),
+
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        let config: ModelPresetConfig;
+        try {
+          config = loadModelPresetConfig({ cwd: ctx?.cwd ?? process.cwd() });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: detail }],
+            details: { error: detail },
+          };
+        }
+        const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+        const registry = (ctx as { modelRegistry?: ModelRegistryLike } | undefined)?.modelRegistry;
+
+        const outcome = await chooseSubagentModel({
+          registry,
+          config,
+          agentName: params.agent,
+          agentDescription: agentDefs?.description,
+          task: params.task,
+          signal,
+        });
+
+        if (!outcome.ok) {
+          return {
+            content: [{ type: "text", text: outcome.error }],
+            details: { error: outcome.error },
+          };
+        }
+
+        const choice = outcome.choice;
+        const presetP = formatProbability(choice.presetProbabilities, choice.preset);
+        const lines = [
+          `Classifier ${choice.classifier.provider}/${choice.classifier.modelId} picked preset "${choice.preset}"${presetP}` +
+            (choice.thinking
+              ? ` with thinking "${choice.thinking}"${formatProbability(choice.thinkingProbabilities, choice.thinking)}`
+              : " and no thinking level"),
+          `Pass to subagent: model: "${choice.modelParam}"`,
+          `Preset model: ${choice.model}`,
+        ];
+        if (choice.supportedThinkingLevels) {
+          lines.push(`Model thinking levels: ${choice.supportedThinkingLevels.join(", ")}`);
+        }
+        if (!choice.modelResolved) {
+          lines.push(
+            "The preset model was not found in the model catalog, so the classified thinking level was kept as is.",
+          );
+        } else if (choice.thinkingClamped) {
+          lines.push("The classified thinking level was clamped to what the model supports.");
+        }
+
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { ...choice },
+        };
+      },
+
+      renderCall(args, theme) {
+        const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
+        const preview = (args.task ?? "").split("\n").find((line: string) => line.trim()) ?? "";
+        let text = theme.fg("accent", "▸") + " " + theme.fg("toolTitle", theme.bold("choose model")) + agent;
+        if (preview) {
+          text += "\n" + theme.fg("toolOutput", preview.length > 100 ? preview.slice(0, 100) + "…" : preview);
+        }
+        return new Text(text, 0, 0);
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        if (details?.modelParam) {
+          return new Text(
+            theme.fg("accent", "▸") +
+              " " +
+              theme.fg("toolTitle", theme.bold(String(details.preset))) +
+              theme.fg("dim", ` → ${details.modelParam}`),
+            0,
+            0,
+          );
+        }
+
+        const text = resultText(result);
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
   // ── subagents_list tool ──
+
   if (shouldRegister("subagents_list"))
     pi.registerTool({
       name: "subagents_list",
@@ -2765,7 +3008,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "List available subagent templates for the subagent tool's agent parameter (NOT a status check — running subagents deliver results automatically).",
       parameters: Type.Object({}),
 
-      async execute() {
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
         const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
 
         if (list.length === 0) {
@@ -2775,16 +3018,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const lines = list.map((a) => {
+        // Resolve preset-backed models so the listing shows the model a spawn
+        // would actually use, e.g. `[smart → anthropic/claude-opus-4-1]`.
+        const modelPresets = loadModelPresetConfig({ cwd: ctx?.cwd ?? process.cwd() });
+        const agents = list.map((agent) => ({
+          ...agent,
+          resolvedModel: formatModelBadge(agent.model, modelPresets),
+        }));
+
+        const lines = agents.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
+          const model = a.resolvedModel ? ` [${a.resolvedModel}]` : "";
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents },
         };
       },
 
@@ -2797,7 +3048,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+          const modelText = a.resolvedModel ?? a.model;
+          const model = modelText ? theme.fg("dim", ` [${modelText}]`) : "";
           return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);

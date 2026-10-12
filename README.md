@@ -65,7 +65,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). 
 
 ### Extensions
 
-**Subagents** — 5 main-session tools + 3 commands, plus 2 subagent-only tools:
+**Subagents** — 8 main-session tools + 3 commands, plus 2 subagent-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -76,6 +76,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). 
 | `subagents_status`   | List subagents still present: tracked entries plus `foreign` live panes (another session's agents) and `orphan` panes/processes (async-free query) |
 | `subagent_cleanup`   | Clean up dead/orphaned subagents: stalled entries, a specific id/name, or a specific `surface` (the stalled/id/name paths refuse a pane that still reports a live agent) |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| `subagent_choose_model` | Ask a classifier model which `modelPresets` tier + thinking level a spawn should use, and return the `model: "<preset>:<thinking>"` value for it |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -135,7 +136,7 @@ These labels are no longer derived from session-file growth. Session JSONL is st
 
 #### Configuration
 
-Status display is controlled by `config.json` in the extension directory; the same file also accepts the optional `piBin` key described below. Copy `config.json.example` to get started:
+Status display is controlled by `config.json` in the extension directory; the same file also accepts the optional `piBin` and `modelPresets` keys described below. Copy `config.json.example` to get started:
 
 ```bash
 cp config.json.example config.json
@@ -146,7 +147,12 @@ cp config.json.example config.json
   "status": {
     "enabled": true
   },
-  "piBin": "pi"
+  "piBin": "pi",
+  "modelPresets": {
+    "fast": { "model": "anthropic/claude-haiku-4-5", "thinking": "low" },
+    "balance": { "model": "anthropic/claude-sonnet-4-5", "thinking": "decisions" },
+    "smart": { "model": "anthropic/claude-opus-4-1" }
+  }
 }
 ```
 
@@ -163,6 +169,69 @@ Pi-backed subagents are launched with a hardcoded `pi` unless a command is confi
 - `subagent_resume` launches with the same command, and the `Resume: …` hints printed in results/pings use it too.
 
 The exact invocation is kept in the launch script (`<artifacts>/subagent-scripts/<name>-<id>.sh`) for debugging.
+
+#### Model presets (`modelPresets`)
+
+Different agents can run different models without repeating model ids in every frontmatter. `config.json` defines named model tiers; an agent opts in by naming one in its `model` field. Presets are **model-only** — each agent keeps its own `thinking` level in frontmatter.
+
+```json
+{
+  "status": { "enabled": true },
+  "piBin": "pi",
+  "modelPresets": {
+    "fast": { "model": "anthropic/claude-haiku-4-5", "thinking": "low" },
+    "balance": { "model": "anthropic/claude-sonnet-4-5", "thinking": "decisions" },
+    "smart": { "model": "anthropic/claude-opus-4-1" }
+  },
+  "defaultPreset": "balance",
+  "classifierModel": "typesafe/jev-latest"
+```
+
+```markdown
+---
+name: scout
+description: Fast codebase recon
+model: fast
+---
+```
+
+- A preset is either an object (`{ "model": …, "description": …, "thinking": … }`) or the shorthand string `"anthropic/claude-haiku-4-5"` (model only), as in `config.json.example` (its model ids are examples — replace them with models your providers serve).
+- `thinking` (optional) is the tier's thinking policy: a level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) **pins** it, so the classifier is never asked about thinking for that tier; `"decisions"` — the default when the key is omitted — lets the classifier pick one per task, restricted to the levels that model supports. The level always travels to pi as `--thinking <level>` (a level pi does not know is a startup warning, never a dead pane).
+- `description` (optional) says what the tier is for; it becomes the classifier criteria for `subagent_choose_model`. The three canonical tiers ship with built-in text, and a `description` in config.json **replaces** the matching one:
+  - `fast` — Quick, cheap work: reconnaissance, lookups, formatting, small mechanical edits
+  - `balance` — Everyday implementation: ordinary features, fixes, tests, reviews, refactors
+  - `smart` — Demanding work: subtle design, hard debugging, cross-cutting changes, architecture
+  Custom tier names have no built-in text, so give them a `description` (e.g. `"smart": { "model": "…", "description": "Architecture decisions only" }`).
+- `classifierModel` (optional) picks the classifier model used for model/thinking decisions, as `"provider/modelId"` (a bare model id also works). Without it, the first classifier model with working credentials is used; if a configured value is not a known classifier model, the error lists the ones that are.
+- `defaultPreset` applies to agents that name no preset and carry no literal `model`. Leave it out (`null`) to keep the historical "inherit the parent session's model" behavior.
+- Resolution order: the `subagent({ model })` tool parameter → agent frontmatter `model` → `defaultPreset` → the parent session's current model. Any of the first three that **names a configured preset** expands to that preset's model; anything else is a literal model id.
+- A **non-preset** `model` string is resolved against the model catalog before launch: `provider/modelId`, a bare id, and partial/alias names (`sonnet`) all work, and the child receives an explicit `--provider`/`--model` pair (mirroring pi's own `--model` resolution). Unknown or ambiguous references fail the spawn with an actionable error — including "in the catalog but its provider has no working credentials" — instead of a pane that dies on "No models match pattern". Preset models are passed through exactly as configured.
+- **A classified thinking level is the default.** A preset with no `thinking` (or `"decisions"`) leaves the level to the classifier, and a spawn that inherits the parent session's model does too — the question offers exactly the levels that model supports, so a max-only model is answered `max` without even asking. A preset that pins a level is used as is, and a spawn with no classifier available, or a model without extended reasoning, simply leaves `--thinking` off — spawning never depends on it.
+- Both `model` fields accept an optional `:<thinking>` suffix — `model: "smart:high"` selects the smart preset *and* thinking level `high`, exactly what `subagent_choose_model` returns. Highest precedence first: the `model` parameter's suffix → frontmatter `thinking` → the frontmatter `model` suffix. A plain literal model keeps pi's own default reasoning level.
+- A literal `model: fast|balance|smart` with no matching preset is rejected at spawn time with an actionable error — it would otherwise kill the child pane with "No models match pattern smart".
+- `subagents_list` shows the resolved model, e.g. `[smart → anthropic/claude-opus-4-1]` (and `[balance (default) → …]` for agents that only inherit `defaultPreset`).
+- Claude Code agents (`cli: claude`) ignore `defaultPreset`: their `--model` expects Claude model names, not pi model targets. An explicit preset reference in frontmatter still applies.
+- Files are **deep-merged** in ascending priority: `config.json` in the extension directory → `$PI_CODING_AGENT_DIR/extensions/pi-interactive-subagents/config.json` (global) → `<session-cwd>/.pi/extensions/pi-interactive-subagents/config.json` (project). Only the keys a layer sets are overridden, so a project file may override `modelPresets.fast` and keep the global `modelPresets.smart`.
+- `extentions/` (the common misspelling) is accepted as a directory alias; the correctly spelled `extensions/` path wins when both exist.
+
+#### Picking a tier with a classifier (`subagent_choose_model`)
+
+When the right tier for a spawn is not obvious, ask a classifier model instead of guessing:
+
+```
+subagent_choose_model({ agent: "worker", task: "Refactor the scheduler and keep the public API stable" })
+→ Classifier typesafe/jev-latest picked preset "smart" (p=0.62) with thinking "high" (p=0.55)
+  Pass to subagent: model: "smart:high"
+  Preset model: anthropic/claude-opus-4-1
+  Model thinking levels: off, minimal, low, medium, high
+```
+
+- One `ctx.modelRegistry.classify()` call asks the questions that are still open: which configured preset fits the task, and — unless every candidate preset pins its own level — how much reasoning effort it needs. The criteria are the preset `description`s (built-ins for `fast`/`balance`/`smart`) and the meaning of each offered thinking level.
+- The thinking question is only asked for presets that defer to the classifier (`"decisions"`, or an omitted `thinking`): a preset that pins a level is used as is, without asking. Its criteria are the **union** of those candidate models' supported levels, so a model that only does `max` — or caps at `high` — is never offered `xhigh`/`max`. A single possible level is adopted without asking, and when no candidate model can reason the question is dropped entirely (no thinking level is set). The answer is still clamped to the preset that won, since the union can be wider than one model's set; when that model is not in the catalog the classified level is kept as is.
+- The tool only recommends — it spawns nothing. Pass the returned `modelParam` (`"smart:high"`) as the `subagent` tool's `model` parameter.
+- Classifier model: `classifierModel` from `config.json`, else the first classifier model with working credentials. With neither, the tool returns a configuration error rather than guessing. The same classifier also fills in the thinking level for spawns that inherit the parent session's model (see [Model presets](#model-presets-modelpresets)).
+- Needs a pi version that exposes classifier models; it is denied by `spawning: false` like the other spawning tools.
+- The `subagent` tool's own prompt guidance points the agent here: when the tier or thinking level is not obvious, it is told to call `subagent_choose_model` first and pass the returned `modelParam` as `model`. That guidance is dropped together with the tool when it is denied (`spawning: false` or `deny-tools: subagent_choose_model`), so the agent is never told to call a tool that does not exist.
 
 ---
 
@@ -193,7 +262,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | —              | Override agent's default model                                                                    |
+| `model`                | string  | —              | Override agent's default model. A configured `modelPresets` name (e.g. `smart`) selects that preset; `smart:high` also sets the thinking level (what `subagent_choose_model` returns). Any other value is a literal model reference — `provider/modelId`, a bare id or a partial name — resolved against the model catalog before launch |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
@@ -317,8 +386,8 @@ You are a specialized agent that does X...
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
-| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
-| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
+| `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`) or a `modelPresets` name such as `fast`/`balance`/`smart`, each optionally with a `:<thinking>` suffix (e.g. `smart:high` — see [Model presets](#model-presets-modelpresets))                                               |
+| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high` (passed to pi as `--thinking`)                                                                                                                                                                     |
 | `system-prompt` | string  | How the agent body is injected: `append` (via `--append-system-prompt`, default prompt + tools list preserved) or `replace` (via `--system-prompt`, swaps the default prompt — tool description text is lost). Omit to inject the body into the task message instead. |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
@@ -463,7 +532,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`, `subagent_choose_model`):
 
 ```yaml
 ---
