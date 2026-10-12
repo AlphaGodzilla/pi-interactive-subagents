@@ -45,12 +45,78 @@ export interface SubagentModelChoice {
   usage?: unknown;
 }
 
+/**
+ * One classifier request, as handed to a {@link ClassifierObserver} for
+ * observability: what was asked, which model answered, the probabilities, what
+ * was decided, how long it took, and any error.
+ */
+export interface ClassifierDecision {
+  /** ISO timestamp of when the request finished. */
+  at: string;
+  /** `choose-model` = tier question, `choose-thinking` = thinking question in the tool, `thinking` = spawn-time thinking decision. */
+  kind: "choose-model" | "choose-thinking" | "thinking";
+  /** Absent when no classifier model could be resolved at all. */
+  classifier?: { provider: string; modelId: string };
+  /** The model the decision was made for, when known. */
+  model?: string;
+  /**
+   * The exact input handed to the classifier (`task`, `agent`,
+   * `agentDescription`, `model`) — without it a logged decision cannot be
+   * explained after the fact.
+   */
+  state: Record<string, unknown>;
+  /** Set when the task text was cut at the classifier input limit. */
+  stateTruncated?: boolean;
+  /** Question id -> what was asked (criteria keys, not their descriptions). */
+  questions: Record<string, { instructions: string; criteria: string[] }>;
+  /** Question id -> the answer the classifier gave. */
+  answers: Record<string, { choice?: string; probabilities?: Record<string, number>; confidence?: number }>;
+  /** What was decided (preset/thinking/modelParam/clamped, ...). */
+  decision: Record<string, unknown>;
+  durationMs: number;
+  usage?: unknown;
+  /** True on the record that completed the decision (the last of a two-call pair). */
+  final?: boolean;
+  error?: string;
+}
+
+/**
+ * Receives every decision request. Callers use it to append the record to the
+ * session log and to notify the user; it must never throw (a broken observer
+ * must not break a spawn).
+ */
+export type ClassifierObserver = (decision: ClassifierDecision) => void;
+
 export type ChooseSubagentModelResult =
   | { ok: true; choice: SubagentModelChoice }
   | { ok: false; error: string };
 
 /** Longest task text handed to a classifier; the rest is dropped. */
 export const MAX_CLASSIFIER_TASK_CHARS = 16_000;
+
+/**
+ * The classifier input for one request, plus whether the task had to be cut.
+ * Classifiers judge a summary, not the whole artifact: a huge task prompt would
+ * blow the classifier's context and cost for no extra signal.
+ */
+function classifierState(input: {
+  task: string;
+  agentName?: string;
+  agentDescription?: string;
+  model?: string;
+}): {
+  state: Record<string, unknown>;
+  truncated: boolean;
+  /** Ready-to-spread decision-record fields. */
+  fields: { state: Record<string, unknown>; stateTruncated?: boolean };
+} {
+  const state: Record<string, unknown> = { task: input.task.slice(0, MAX_CLASSIFIER_TASK_CHARS) };
+  if (input.agentName) state.agent = input.agentName;
+  if (input.agentDescription) state.agentDescription = input.agentDescription;
+  if (input.model) state.model = input.model;
+  const truncated = input.task.length > MAX_CLASSIFIER_TASK_CHARS;
+  return { state, truncated, fields: { state, ...(truncated ? { stateTruncated: true } : {}) } };
+}
 
 /**
  * Built-in meaning of the three canonical tiers, used when a preset carries no
@@ -220,13 +286,91 @@ function presetCriteria(preset: ModelPreset, name: string): string {
   return preset.description ?? CANONICAL_PRESET_CRITERIA[name] ?? `Model preset "${name}"`;
 }
 
+/** Question id -> what was asked, for the decision record. */
+function describeQuestions(questions: Record<string, unknown>): ClassifierDecision["questions"] {
+  const described: ClassifierDecision["questions"] = {};
+  for (const [id, question] of Object.entries(questions)) {
+    if (question == null || typeof question !== "object") continue;
+    const value = question as { instructions?: unknown; criteria?: unknown };
+    const criteria = value.criteria != null && typeof value.criteria === "object" ? value.criteria : {};
+    described[id] = {
+      instructions: typeof value.instructions === "string" ? value.instructions : "",
+      criteria: Object.keys(criteria as Record<string, unknown>),
+    };
+  }
+  return described;
+}
+
+/** Question id -> the answer received, for the decision record. */
+function describeAnswers(result: ClassifierResultLike | undefined): ClassifierDecision["answers"] {
+  const described: ClassifierDecision["answers"] = {};
+  for (const [id, answer] of Object.entries(result?.answers ?? {})) {
+    described[id] = {
+      ...(typeof answer?.choice === "string" ? { choice: answer.choice } : {}),
+      ...(answer?.probabilities ? { probabilities: answer.probabilities } : {}),
+      ...(typeof answer?.confidence === "number" ? { confidence: answer.confidence } : {}),
+    };
+  }
+  return described;
+}
+
+/** Run one classify call, measuring it and turning every failure into a value. */
+async function runClassify(input: {
+  registry: ModelRegistryLike;
+  model: unknown;
+  state: Record<string, unknown>;
+  questions: Record<string, unknown>;
+  signal?: AbortSignal;
+}): Promise<
+  | { ok: true; result: ClassifierResultLike; durationMs: number }
+  | { ok: false; result?: ClassifierResultLike; durationMs: number; error: string }
+> {
+  const startedAt = Date.now();
+  try {
+    const result = await input.registry.classify!(
+      input.model,
+      { state: input.state, questions: input.questions },
+      { signal: input.signal },
+    );
+    const durationMs = Date.now() - startedAt;
+    if (result?.stopReason !== "stop") {
+      return {
+        ok: false,
+        result,
+        durationMs,
+        error: result?.errorMessage ?? result?.stopReason ?? "no result",
+      };
+    }
+    return { ok: true, result, durationMs };
+  } catch (error) {
+    // classify() never rejects on the real registry, but a foreign/stale
+    // registry implementation must not take the whole call down.
+    const detail = error instanceof Error ? error.message : String(error);
+    return { ok: false, durationMs: Date.now() - startedAt, error: detail };
+  }
+}
+
+/** Hand a record to the observer; observability must never break the caller. */
+function reportDecision(observer: ClassifierObserver | undefined, decision: ClassifierDecision): void {
+  if (!observer) return;
+  try {
+    observer(decision);
+  } catch {
+    // A broken observer must not fail the spawn/tool call.
+  }
+}
+
 /**
- * Classify a subagent task into a preset + thinking level, then clamp the level
- * to what the preset's model actually supports.
+ * Pick the model tier and thinking level for a subagent task.
  *
- * One classify call asks both questions; the thinking answer is resolved against
- * the concrete model afterwards, so `model: "smart:high"` never asks for a level
- * the chosen model cannot do.
+ * Two classify calls, in order:
+ *   1. which configured tier fits the task (skipped when only one is configured);
+ *   2. how much reasoning that tier's model needs — the criteria are generated
+ *      from the **chosen model's own supported levels**, so an answer can never
+ *      pair a "low" intent with a model that only does `xhigh`/`max`.
+ *
+ * A preset that pins `thinking` skips call 2 entirely. Every request is reported
+ * to `observer`, with the last record of the pair marked `final`.
  */
 export async function chooseSubagentModel(input: {
   registry?: ModelRegistryLike;
@@ -235,6 +379,7 @@ export async function chooseSubagentModel(input: {
   agentDescription?: string;
   task: string;
   signal?: AbortSignal;
+  observer?: ClassifierObserver;
 }): Promise<ChooseSubagentModelResult> {
   const presetNames = Object.keys(input.config.presets);
   if (presetNames.length === 0) {
@@ -246,98 +391,247 @@ export async function chooseSubagentModel(input: {
     };
   }
 
-  const resolved = await resolveClassifierModel(input.registry, input.config.classifierModel);
-  if (!resolved.ok) return resolved;
-
   const registry = input.registry as ModelRegistryLike;
+
+  // Built before the classifier is resolved so a failed request still records
+  // exactly what would have been asked, and with which input.
+  const tierState = classifierState({
+    task: input.task,
+    agentName: input.agentName,
+    agentDescription: input.agentDescription,
+  });
+  const presetQuestion =
+    presetNames.length > 1
+      ? {
+          type: "choice",
+          instructions: "Which model tier should handle this subagent task?",
+          criteria: Object.fromEntries(
+            presetNames.map((name) => [name, presetCriteria(input.config.presets[name], name)]),
+          ),
+        }
+      : undefined;
+
+  const resolved = await resolveClassifierModel(input.registry, input.config.classifierModel);
+  if (!resolved.ok) {
+    reportDecision(input.observer, {
+      at: new Date().toISOString(),
+      kind: "choose-model",
+      ...tierState.fields,
+      questions: describeQuestions(presetQuestion ? { preset: presetQuestion } : {}),
+      answers: {},
+      decision: {},
+      durationMs: 0,
+      final: true,
+      error: resolved.error,
+    });
+    return resolved;
+  }
   const { ref } = resolved;
+  const who = `${ref.provider}/${ref.modelId}`;
 
-  // Presets that pin a thinking level never need the question — the configured
-  // level is used as is. Only the presets that defer to the classifier
-  // ("decisions", the default) contribute candidates.
-  const decidingPresets = presetNames
-    .map((name) => input.config.presets[name])
-    .filter((preset) => (preset.thinking ?? THINKING_DECISIONS) === THINKING_DECISIONS);
-
-  // Which thinking levels are worth asking about: the union of what those
-  // candidate models support, so a model that only does `max` (or caps at
-  // `high`) is never offered a level it cannot run. `undefined` means none of
-  // them is in the catalog, so every level is offered and the answer is clamped
-  // afterwards.
-  const candidates = candidateThinkingLevels(registry, decidingPresets);
-  const levels = candidates ?? [...THINKING_LEVELS];
-  const askThinking = decidingPresets.length > 0 && levels.length > 1;
-  // A single supported level needs no question. "off" alone means there is no
-  // reasoning to configure, so it stays unset.
-  const onlyLevel =
-    decidingPresets.length > 0 && levels.length === 1 && levels[0] !== "off" ? levels[0] : undefined;
-
-  const questions: Record<string, unknown> = {};
-  if (presetNames.length > 1) {
-    questions.preset = {
-      type: "choice",
-      instructions: "Which model tier should handle this subagent task?",
-      criteria: Object.fromEntries(
-        presetNames.map((name) => [name, presetCriteria(input.config.presets[name], name)]),
-      ),
-    };
-  }
-  if (askThinking) questions.thinking = thinkingQuestion(levels);
-
-  // Nothing to ask (a single preset whose model has a single supported level):
-  // the decision is already determined, so skip the classifier call entirely —
-  // classify() expects at least one question.
-  let result: ClassifierResultLike | undefined;
-  if (Object.keys(questions).length > 0) {
-    // Classifiers judge a summary, not the whole artifact: a huge task prompt
-    // would blow the classifier's context and cost for no extra signal.
-    const state: Record<string, unknown> = { task: input.task.slice(0, MAX_CLASSIFIER_TASK_CHARS) };
-    if (input.agentName) state.agent = input.agentName;
-    if (input.agentDescription) state.agentDescription = input.agentDescription;
-
-    try {
-      result = await registry.classify!(ref.model, { state, questions }, { signal: input.signal });
-    } catch (error) {
-      // classify() never rejects on the real registry, but a foreign/stale
-      // registry implementation must not take the whole tool call down.
-      const detail = error instanceof Error ? error.message : String(error);
-      return { ok: false, error: `Classifier ${ref.provider}/${ref.modelId} call failed: ${detail}` };
-    }
-
-    if (result?.stopReason !== "stop") {
-      const detail = result?.errorMessage ?? result?.stopReason ?? "no result";
-      return { ok: false, error: `Classifier ${ref.provider}/${ref.modelId} failed: ${detail}` };
-    }
-  }
-
-  const presetPick =
+  // ── Call 1: which tier ──
+  let presetPick:
+    | { choice: string; probabilities: Record<string, number>; confidence?: number }
+    | undefined =
     presetNames.length === 1
-      ? { choice: presetNames[0], probabilities: {}, confidence: undefined }
-      : pickChoice(result?.answers?.preset, presetNames);
+      ? { choice: presetNames[0], probabilities: {} }
+      : undefined;
+  let tierResult: ClassifierResultLike | undefined;
+  let tierDurationMs = 0;
+
+  if (presetQuestion) {
+    const outcome = await runClassify({
+      registry,
+      model: ref.model,
+      state: tierState.state,
+      questions: { preset: presetQuestion },
+      signal: input.signal,
+    });
+    tierDurationMs = outcome.durationMs;
+    tierResult = outcome.result;
+
+    if (!outcome.ok) {
+      reportDecision(input.observer, {
+        at: new Date().toISOString(),
+        kind: "choose-model",
+        classifier: { provider: ref.provider, modelId: ref.modelId },
+        ...tierState.fields,
+        questions: describeQuestions({ preset: presetQuestion }),
+        answers: describeAnswers(outcome.result),
+        decision: {},
+        durationMs: tierDurationMs,
+        ...(outcome.result?.usage !== undefined ? { usage: outcome.result.usage } : {}),
+        final: true,
+        error: outcome.error,
+      });
+      return { ok: false, error: `Classifier ${who} failed: ${outcome.error}` };
+    }
+
+    presetPick = pickChoice(outcome.result.answers?.preset, presetNames);
+    if (!presetPick) {
+      const error = `Classifier ${who} returned no usable preset answer.`;
+      reportDecision(input.observer, {
+        at: new Date().toISOString(),
+        kind: "choose-model",
+        classifier: { provider: ref.provider, modelId: ref.modelId },
+        ...tierState.fields,
+        questions: describeQuestions({ preset: presetQuestion }),
+        answers: describeAnswers(tierResult),
+        decision: {},
+        durationMs: tierDurationMs,
+        final: true,
+        error,
+      });
+      return { ok: false, error };
+    }
+  }
+
+  // Unreachable: a single preset is taken directly and the tier call above
+  // either answered or already returned an error.
   if (!presetPick) {
-    return {
-      ok: false,
-      error: `Classifier ${ref.provider}/${ref.modelId} returned no usable preset answer.`,
-    };
+    return { ok: false, error: `Classifier ${who} returned no usable preset answer.` };
   }
 
   const preset = input.config.presets[presetPick.choice];
   const policy = preset.thinking ?? THINKING_DECISIONS;
 
-  // The concrete model the preset points at decides the supported levels and
-  // clamps a classified answer (the question may have offered the union across
-  // presets, so the answer can still sit outside what this model supports).
+  // The concrete model the chosen tier points at decides which levels call 2 may
+  // offer. No catalog entry means no way to narrow them down, so every level is
+  // offered (and nothing is clamped).
   const chatModel = resolveChatModel(registry, preset.model);
   const supported = chatModel ? supportedThinkingLevels(chatModel) : undefined;
+  const levels = supported ?? [...THINKING_LEVELS];
 
-  // A configured level is used as is — the classifier is never asked about it.
-  const thinkingPick = askThinking ? pickChoice(result?.answers?.thinking, levels) : undefined;
-  const requested =
-    policy === THINKING_DECISIONS
-      ? ((thinkingPick?.choice as ThinkingLevelName | undefined) ?? onlyLevel)
-      : (policy as ThinkingLevelName);
-  // Without a catalog entry there is nothing to clamp against.
-  const thinking = requested ? (chatModel ? clampThinkingLevel(chatModel, requested) : requested) : undefined;
+  const askThinking = policy === THINKING_DECISIONS && levels.length > 1;
+  // A single supported level needs no question. "off" alone means there is no
+  // reasoning to configure, so it stays unset.
+  const pinnedRequest =
+    policy !== THINKING_DECISIONS ? (policy as ThinkingLevelName) : levels.length === 1 && levels[0] !== "off" ? levels[0] : undefined;
+  const pinnedThinking = pinnedRequest
+    ? chatModel
+      ? clampThinkingLevel(chatModel, pinnedRequest)
+      : pinnedRequest
+    : undefined;
+
+  // The tier record: `final` only when no thinking call follows it.
+  if (presetQuestion) {
+    reportDecision(input.observer, {
+      at: new Date().toISOString(),
+      kind: "choose-model",
+      classifier: { provider: ref.provider, modelId: ref.modelId },
+      model: preset.model,
+      ...tierState.fields,
+      questions: describeQuestions({ preset: presetQuestion }),
+      answers: describeAnswers(tierResult),
+      decision: {
+        preset: presetPick.choice,
+        model: preset.model,
+        policy,
+        ...(pinnedThinking ? { thinking: pinnedThinking } : {}),
+      },
+      durationMs: tierDurationMs,
+      ...(tierResult?.usage !== undefined ? { usage: tierResult.usage } : {}),
+      final: !askThinking,
+    });
+  }
+
+  // ── Call 2: how much thinking, for the model that just won ──
+  const thinkingState = classifierState({
+    task: input.task,
+    agentName: input.agentName,
+    agentDescription: input.agentDescription,
+    model: preset.model,
+  });
+  const thinkingQuestions = askThinking ? { thinking: thinkingQuestion(levels) } : {};
+
+  let thinkingResult: ClassifierResultLike | undefined;
+  let thinkingDurationMs = 0;
+  let thinkingPick: ReturnType<typeof pickChoice>;
+  let requested = pinnedRequest;
+
+  if (askThinking) {
+    const outcome = await runClassify({
+      registry,
+      model: ref.model,
+      state: thinkingState.state,
+      questions: thinkingQuestions,
+      signal: input.signal,
+    });
+    thinkingDurationMs = outcome.durationMs;
+    thinkingResult = outcome.result;
+
+    if (!outcome.ok) {
+      const error = `Classifier ${who} failed: ${outcome.error}`;
+      reportDecision(input.observer, {
+        at: new Date().toISOString(),
+        kind: "choose-thinking",
+        classifier: { provider: ref.provider, modelId: ref.modelId },
+        model: preset.model,
+        ...thinkingState.fields,
+        questions: describeQuestions(thinkingQuestions),
+        answers: describeAnswers(outcome.result),
+        decision: {},
+        durationMs: thinkingDurationMs,
+        ...(outcome.result?.usage !== undefined ? { usage: outcome.result.usage } : {}),
+        final: true,
+        error: outcome.error,
+      });
+      return { ok: false, error };
+    }
+
+    thinkingPick = pickChoice(outcome.result.answers?.thinking, levels);
+    if (!thinkingPick) {
+      const error = `Classifier ${who} returned no usable thinking answer.`;
+      reportDecision(input.observer, {
+        at: new Date().toISOString(),
+        kind: "choose-thinking",
+        classifier: { provider: ref.provider, modelId: ref.modelId },
+        model: preset.model,
+        ...thinkingState.fields,
+        questions: describeQuestions(thinkingQuestions),
+        answers: describeAnswers(thinkingResult),
+        decision: {},
+        durationMs: thinkingDurationMs,
+        final: true,
+        error,
+      });
+      return { ok: false, error };
+    }
+    requested = thinkingPick.choice as ThinkingLevelName;
+  }
+
+  const thinking = requested
+    ? chatModel
+      ? clampThinkingLevel(chatModel, requested)
+      : requested
+    : undefined;
+  const thinkingClamped = requested !== undefined && thinking !== undefined && thinking !== requested;
+
+  if (askThinking) {
+    reportDecision(input.observer, {
+      at: new Date().toISOString(),
+      kind: "choose-thinking",
+      classifier: { provider: ref.provider, modelId: ref.modelId },
+      model: preset.model,
+      ...thinkingState.fields,
+      questions: describeQuestions(thinkingQuestions),
+      answers: describeAnswers(thinkingResult),
+      decision: {
+        preset: presetPick.choice,
+        model: preset.model,
+        modelParam: thinking ? `${presetPick.choice}:${thinking}` : presetPick.choice,
+        ...(thinking ? { thinking } : {}),
+        ...(requested && requested !== thinking ? { requested } : {}),
+        clamped: thinkingClamped,
+        policy,
+        candidates: levels,
+      },
+      durationMs: thinkingDurationMs,
+      ...(thinkingResult?.usage !== undefined ? { usage: thinkingResult.usage } : {}),
+      final: true,
+    });
+  }
+
   return {
     ok: true,
     choice: {
@@ -351,9 +645,11 @@ export async function chooseSubagentModel(input: {
       ...(thinkingPick?.confidence !== undefined ? { thinkingConfidence: thinkingPick.confidence } : {}),
       classifier: { provider: ref.provider, modelId: ref.modelId },
       ...(supported ? { supportedThinkingLevels: supported } : {}),
-      thinkingClamped: requested !== undefined && thinking !== undefined && thinking !== requested,
+      thinkingClamped,
       modelResolved: chatModel !== undefined,
-      ...(result?.usage !== undefined ? { usage: result.usage } : {}),
+      ...((thinkingResult ?? tierResult)?.usage !== undefined
+        ? { usage: thinkingResult?.usage ?? tierResult?.usage }
+        : {}),
     },
   };
 }
@@ -393,6 +689,7 @@ export async function chooseThinkingLevel(input: {
   /** The model the child will run on; decides which levels are offered. */
   model?: { provider?: string; id?: string };
   signal?: AbortSignal;
+  observer?: ClassifierObserver;
 }): Promise<ChooseThinkingLevelResult> {
   const reference = input.model?.id
     ? input.model.provider
@@ -417,45 +714,105 @@ export async function chooseThinkingLevel(input: {
     };
   }
 
-  const resolved = await resolveClassifierModel(input.registry, input.config.classifierModel);
-  if (!resolved.ok) return resolved;
+  const questions = { thinking: thinkingQuestion(levels) };
 
+  // Built before the classifier is resolved so a failed request still records
+  // what would have been asked, and with which input.
+  const inputState = classifierState({
+    task: input.task,
+    agentName: input.agentName,
+    agentDescription: input.agentDescription,
+    model: reference,
+  });
+  const stateFields = inputState.fields;
+
+  const resolved = await resolveClassifierModel(input.registry, input.config.classifierModel);
+  if (!resolved.ok) {
+    reportDecision(input.observer, {
+      at: new Date().toISOString(),
+      kind: "thinking",
+      ...(reference ? { model: reference } : {}),
+      ...stateFields,
+      questions: describeQuestions(questions),
+      answers: {},
+      decision: {},
+      durationMs: 0,
+      final: true,
+      error: resolved.error,
+    });
+    return resolved;
+  }
 
   const registry = input.registry as ModelRegistryLike;
   const { ref } = resolved;
 
-  const state: Record<string, unknown> = { task: input.task.slice(0, MAX_CLASSIFIER_TASK_CHARS) };
-  if (input.agentName) state.agent = input.agentName;
-  if (input.agentDescription) state.agentDescription = input.agentDescription;
-  if (reference) state.model = reference;
-
-  let result: ClassifierResultLike;
-  try {
-    result = await registry.classify!(
-      ref.model,
-      {
-        state,
-        questions: { thinking: thinkingQuestion(levels) },
-      },
-      { signal: input.signal },
-    );
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: `Classifier ${ref.provider}/${ref.modelId} call failed: ${detail}` };
+  const outcome = await runClassify({
+    registry,
+    model: ref.model,
+    state: inputState.state,
+    questions,
+    signal: input.signal,
+  });
+  if (!outcome.ok) {
+    const error = `Classifier ${ref.provider}/${ref.modelId} failed: ${outcome.error}`;
+    reportDecision(input.observer, {
+      at: new Date().toISOString(),
+      kind: "thinking",
+      classifier: { provider: ref.provider, modelId: ref.modelId },
+      ...(reference ? { model: reference } : {}),
+      ...stateFields,
+      questions: describeQuestions(questions),
+      answers: describeAnswers(outcome.result),
+      decision: {},
+      durationMs: outcome.durationMs,
+      ...(outcome.result?.usage !== undefined ? { usage: outcome.result.usage } : {}),
+      final: true,
+      error: outcome.error,
+    });
+    return { ok: false, error };
   }
-
-  if (result?.stopReason !== "stop") {
-    const detail = result?.errorMessage ?? result?.stopReason ?? "no result";
-    return { ok: false, error: `Classifier ${ref.provider}/${ref.modelId} failed: ${detail}` };
-  }
+  const result = outcome.result;
 
   const pick = pickChoice(result.answers?.thinking, levels);
   if (!pick) {
-    return { ok: false, error: `Classifier ${ref.provider}/${ref.modelId} returned no usable thinking answer.` };
+    const error = `Classifier ${ref.provider}/${ref.modelId} returned no usable thinking answer.`;
+    reportDecision(input.observer, {
+      at: new Date().toISOString(),
+      kind: "thinking",
+      classifier: { provider: ref.provider, modelId: ref.modelId },
+      ...(reference ? { model: reference } : {}),
+      ...stateFields,
+      questions: describeQuestions(questions),
+      answers: describeAnswers(result),
+      decision: {},
+      durationMs: outcome.durationMs,
+      ...(result?.usage !== undefined ? { usage: result.usage } : {}),
+      final: true,
+      error,
+    });
+    return { ok: false, error };
   }
 
   // The criteria were already restricted to `levels`, so no clamping is needed.
   const thinking = pick.choice as ThinkingLevelName;
+
+  reportDecision(input.observer, {
+    at: new Date().toISOString(),
+    kind: "thinking",
+    classifier: { provider: ref.provider, modelId: ref.modelId },
+    ...(reference ? { model: reference } : {}),
+    ...stateFields,
+    questions: describeQuestions(questions),
+    answers: describeAnswers(result),
+    decision: {
+      thinking,
+      ...(reference ? { model: reference } : {}),
+      clamped: false,
+    },
+    durationMs: outcome.durationMs,
+    ...(result?.usage !== undefined ? { usage: result.usage } : {}),
+    final: true,
+  });
 
   return {
     ok: true,

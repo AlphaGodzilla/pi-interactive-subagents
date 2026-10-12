@@ -66,7 +66,10 @@ import {
 import {
   chooseSubagentModel,
   chooseThinkingLevel,
+  type ClassifierDecision,
+  type ClassifierObserver,
 } from "./model-classifier.ts";
+import { appendClassifierDecision, describeClassifierDecision } from "./classifier-log.ts";
 import { resolveLaunchModelTarget, type ModelRegistryLike } from "./model-registry.ts";
 import {
   getSubagentActivityFile,
@@ -525,6 +528,26 @@ function formatModelBadge(model: string | undefined, config: ModelPresetConfig):
     return `${resolved.preset} (default) → ${resolved.model}`;
   }
   return resolved.model;
+}
+
+/**
+ * Observability for classifier (decision model) requests: append the record to
+ * the session's `classifier-decisions.jsonl` and tell the user what was decided.
+ * Failures are logged but not notified — a missing classifier must not nag on
+ * every spawn.
+ */
+function makeClassifierObserver(options: {
+  artifactDir?: string;
+  notify?: (message: string, type?: "info" | "warning" | "error") => void;
+}): ClassifierObserver {
+  return (decision: ClassifierDecision) => {
+    if (options.artifactDir) appendClassifierDecision(options.artifactDir, decision);
+    // One notification per completed decision: a two-call decision reports the
+    // tier first (final: false) and the thinking level last.
+    if (decision.final !== false && !decision.error && options.notify) {
+      options.notify(describeClassifierDecision(decision), "info");
+    }
+  };
 }
 
 /** ` (p=0.62)` for the picked label, when the classifier reported probabilities. */
@@ -1761,6 +1784,8 @@ async function launchSubagent(
     cwd: string;
     /** Used to resolve literal `model` strings into a concrete provider/model pair. */
     modelRegistry?: ModelRegistryLike;
+    /** Optional UI, used to surface classifier decisions as they happen. */
+    ui?: { notify(message: string, type?: "info" | "warning" | "error"): void };
   },
   options?: { surface?: string; worktree?: HerdrWorktreeContext },
 ): Promise<RunningSubagent> {
@@ -2031,6 +2056,10 @@ async function launchSubagent(
       agentDescription: agentDefs?.description,
       task: params.task,
       model: childModel,
+      observer: makeClassifierObserver({
+        artifactDir,
+        ...(ctx.ui ? { notify: (message, type) => ctx.ui!.notify(message, type) } : {}),
+      }),
     });
     if (picked.ok && picked.thinking) {
       parts.push("--thinking", shellEscape(picked.thinking));
@@ -2922,6 +2951,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
         const registry = (ctx as { modelRegistry?: ModelRegistryLike } | undefined)?.modelRegistry;
 
+        // Classifier decisions are observable: one line per request in the
+        // session's classifier-decisions.jsonl, plus a UI notification.
+        const sessionManager = (
+          ctx as { sessionManager?: { getSessionDir(): string; getSessionId(): string } } | undefined
+        )?.sessionManager;
+        const observer = makeClassifierObserver({
+          ...(sessionManager
+            ? {
+                artifactDir: getArtifactDir(
+                  sessionManager.getSessionDir(),
+                  sessionManager.getSessionId(),
+                ),
+              }
+            : {}),
+          ...(ctx?.ui ? { notify: (message, type) => ctx.ui.notify(message, type) } : {}),
+        });
+
         const outcome = await chooseSubagentModel({
           registry,
           config,
@@ -2929,6 +2975,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           agentDescription: agentDefs?.description,
           task: params.task,
           signal,
+          observer,
         });
 
         if (!outcome.ok) {

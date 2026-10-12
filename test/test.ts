@@ -86,7 +86,13 @@ import {
 import {
   chooseSubagentModel,
   chooseThinkingLevel,
+  type ClassifierDecision,
 } from "../pi-extension/subagents/model-classifier.ts";
+import {
+  appendClassifierDecision,
+  classifierDecisionLogPath,
+  describeClassifierDecision,
+} from "../pi-extension/subagents/classifier-log.ts";
 import {
   resolveChatModel,
   resolveLaunchModelTarget,
@@ -4536,7 +4542,7 @@ describe("subagent_choose_model classifier", () => {
     answers?: Record<string, unknown>;
     stopReason?: string;
     errorMessage?: string;
-    seen?: { model?: unknown; context?: any; options?: any };
+    seen?: { model?: unknown; context?: any; options?: any; calls?: Array<{ model?: unknown; context?: any }> };
   }) {
     const classifier = options.classifier ?? { provider: "typesafe", id: "jev-latest" };
     return {
@@ -4545,6 +4551,9 @@ describe("subagent_choose_model classifier", () => {
           options.seen.model = model;
           options.seen.context = context;
           options.seen.options = opts;
+          // Every request is kept: a decision is two calls now (tier first, then
+          // the thinking levels of the chosen model).
+          (options.seen.calls ??= []).push({ model, context });
         }
         return {
           provider: classifier.provider,
@@ -4607,23 +4616,86 @@ describe("subagent_choose_model classifier", () => {
     assert.deepEqual(outcome.choice.supportedThinkingLevels, ["off", "minimal", "low", "medium", "high"]);
 
     const questions = seen.context.questions;
-    assert.equal(questions.preset.criteria.smart, "Hard design and debugging");
-    assert.equal(questions.preset.criteria.fast.length > 0, true);
-    // Union over the candidate models: prov/opus and prov/sonnet cap at high,
-    // prov/haiku does not reason at all — so xhigh/max are never asked about.
-    assert.deepEqual(Object.keys(questions.thinking.criteria), [
+    // Two calls: the tier first, then the thinking levels of the model that won
+    // — generated from that model, not from the union across presets.
+    const calls = seen.calls ?? [];
+    assert.equal(calls.length, 2);
+    assert.deepEqual(Object.keys(calls[0].context.questions), ["preset"]);
+    assert.equal(calls[0].context.questions.preset.criteria.smart, "Hard design and debugging");
+    assert.equal(calls[0].context.questions.preset.criteria.fast.length > 0, true);
+    assert.deepEqual(calls[0].context.state, {
+      task: "Refactor the scheduler",
+      agent: "worker",
+      agentDescription: "Implements tasks",
+    });
+
+    assert.deepEqual(Object.keys(calls[1].context.questions), ["thinking"]);
+    // prov/opus caps at high — xhigh/max are not offered, and neither are the
+    // levels that only other presets' models support.
+    assert.deepEqual(Object.keys(calls[1].context.questions.thinking.criteria), [
       "off",
       "minimal",
       "low",
       "medium",
       "high",
     ]);
-    assert.deepEqual(seen.context.state, {
+    assert.deepEqual(calls[1].context.state, {
       task: "Refactor the scheduler",
       agent: "worker",
       agentDescription: "Implements tasks",
+      model: "prov/opus",
     });
     assert.equal(seen.model, registry.getModelOfType("classifier", "typesafe", "jev-latest"));
+  });
+
+  it("asks thinking only for the levels the chosen model supports", async () => {
+    const seen: { calls?: Array<{ context?: any }> } = {};
+    // fast only does low/high, smart only does xhigh/max: the thinking question
+    // must follow the tier answer, or a "low" answer could land on the max-only
+    // model (and be clamped into something nobody asked for).
+    const chatModels = [
+      {
+        provider: "prov",
+        id: "fast-model",
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: null, medium: null, low: "low", high: "high", xhigh: null, max: null },
+      },
+      {
+        provider: "prov",
+        id: "smart-model",
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: "x", max: "m" },
+      },
+    ];
+    const classifier = { provider: "typesafe", id: "jev-latest" };
+    const registry = {
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifier] : chatModels),
+      getAvailableOfType: async () => [classifier],
+      classify: async (_model: unknown, context: any) => {
+        (seen.calls ??= []).push({ context });
+        const asked = Object.keys(context.questions);
+        return {
+          stopReason: "stop",
+          answers: asked.includes("preset")
+            ? { preset: { type: "choice", choice: "smart", probabilities: { fast: 0.1, smart: 0.9 } } }
+            : { thinking: { type: "choice", choice: "xhigh", probabilities: { xhigh: 1 } } },
+        };
+      },
+    } as any;
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config: {
+        ...config,
+        presets: { fast: { model: "prov/fast-model" }, smart: { model: "prov/smart-model" } },
+      },
+      task: "t",
+    });
+
+    assert.equal(outcome.ok && outcome.choice.modelParam, "smart:xhigh");
+    const calls = seen.calls ?? [];
+    assert.equal(calls.length, 2);
+    assert.deepEqual(Object.keys(calls[1].context.questions.thinking.criteria), ["xhigh", "max"]);
   });
 
   it("asks no thinking question when no candidate model can reason", async () => {
@@ -4741,7 +4813,10 @@ describe("subagent_choose_model classifier", () => {
 
   it("uses the configured classifierModel and otherwise the first available one", async () => {
     const registry = makeRegistry({
-      answers: { preset: { choice: "fast", probabilities: { fast: 1 } } },
+      answers: {
+        preset: { choice: "fast", probabilities: { fast: 1 } },
+        thinking: { choice: "low", probabilities: { low: 1 } },
+      },
     });
 
     const configured = await chooseSubagentModel({
@@ -4767,7 +4842,10 @@ describe("subagent_choose_model classifier", () => {
       registry: makeRegistry({
         classifier: other,
         available: [other],
-        answers: { preset: { choice: "balance", probabilities: { balance: 1 } } },
+        answers: {
+          preset: { choice: "balance", probabilities: { balance: 1 } },
+          thinking: { choice: "low", probabilities: { low: 1 } },
+        },
       }),
       config,
       task: "t",
@@ -4947,6 +5025,7 @@ describe("subagent_choose_model classifier", () => {
       (subagentsModule as any).default(api);
       const tool = registeredTools.find((entry) => entry.name === "subagent_choose_model");
 
+      const notifications: string[] = [];
       const result = await tool.execute("call-1", { task: "Hard refactor" }, undefined, undefined, {
         cwd: dir,
         modelRegistry: makeRegistry({
@@ -4955,6 +5034,8 @@ describe("subagent_choose_model classifier", () => {
             thinking: { type: "choice", choice: "high", probabilities: { high: 1 } },
           },
         }),
+        sessionManager: { getSessionDir: () => dir, getSessionId: () => "session-1" },
+        ui: { notify: (message: string) => notifications.push(message) },
       });
 
       assert.match(result.content[0].text, /model: "smart:high"/);
@@ -4963,6 +5044,31 @@ describe("subagent_choose_model classifier", () => {
       assert.equal(result.details.modelParam, "smart:high");
       assert.equal(result.details.thinking, "high");
       assert.equal(result.details.classifier.modelId, "jev-latest");
+
+      // The request is observable: a JSONL line in the session artifacts plus a
+      // UI notification.
+      const logPath = join(dir, "artifacts", "session-1", "classifier-decisions.jsonl");
+      const records = readFileSync(logPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      // Two requests: the tier, then the thinking levels of the chosen model.
+      assert.equal(records.length, 2);
+      assert.equal(records[0].kind, "choose-model");
+      assert.equal(records[0].final, false);
+      assert.deepEqual(Object.keys(records[0].questions), ["preset"]);
+      assert.equal(records[0].decision.preset, "smart");
+      assert.equal(records[1].kind, "choose-thinking");
+      assert.equal(records[1].final, true);
+      assert.deepEqual(Object.keys(records[1].questions), ["thinking"]);
+      assert.equal(records[1].decision.modelParam, "smart:high");
+      // The task text the caller passed is logged, so the choice is explainable.
+      assert.equal(records[0].state.task, "Hard refactor");
+      assert.equal(records[1].state.task, "Hard refactor");
+      assert.equal(records[1].state.model, "prov/opus");
+      // One notification per completed decision (the final record only).
+      assert.equal(notifications.length, 1);
+      assert.match(notifications[0], /model: smart:high · typesafe\/jev-latest · \d+ms/);
     });
   });
 });
@@ -5338,5 +5444,227 @@ describe("inherited-model thinking selection", () => {
     });
     assert.equal(unusable.ok, false);
     assert.match(unusable.ok ? "" : unusable.error, /no usable thinking answer/);
+  });
+});
+
+
+describe("classifier decision observability", () => {
+  const decision: ClassifierDecision = {
+    at: "2026-10-12T00:00:00.000Z",
+    kind: "thinking",
+    classifier: { provider: "typesafe", modelId: "jev-latest" },
+    model: "prov/opus",
+    state: { task: "Refactor the scheduler", model: "prov/opus" },
+    questions: { thinking: { instructions: "How much effort?", criteria: ["off", "high"] } },
+    answers: { thinking: { choice: "high", probabilities: { high: 0.7 }, confidence: 0.7 } },
+    decision: { thinking: "high", clamped: false },
+    durationMs: 12,
+  };
+
+  it("appends one JSON line per decision", () => {
+    withTempDir((dir) => {
+      assert.equal(appendClassifierDecision(dir, decision), classifierDecisionLogPath(dir));
+      appendClassifierDecision(dir, { ...decision, kind: "choose-model" });
+
+      const lines = readFileSync(classifierDecisionLogPath(dir), "utf8").trim().split("\n");
+      assert.equal(lines.length, 2);
+      assert.deepEqual(JSON.parse(lines[0]), decision);
+      assert.equal(JSON.parse(lines[1]).kind, "choose-model");
+    });
+  });
+
+  it("never throws when the log cannot be written", () => {
+    withTempDir((dir) => {
+      const file = join(dir, "not-a-dir");
+      writeFileSync(file, "x");
+
+      assert.equal(appendClassifierDecision(join(file, "nested"), decision), undefined);
+    });
+  });
+
+  it("describes decisions for the UI", () => {
+    assert.match(describeClassifierDecision(decision), /thinking: high · typesafe\/jev-latest · 12ms/);
+    assert.match(
+      describeClassifierDecision({ ...decision, error: "gateway timeout" }),
+      /classifier typesafe\/jev-latest — gateway timeout \(12ms\)/,
+    );
+    assert.match(
+      describeClassifierDecision({
+        ...decision,
+        kind: "choose-model",
+        decision: { modelParam: "smart:high" },
+      }),
+      /model: smart:high · typesafe\/jev-latest · 12ms/,
+    );
+    // The record that completes a tool decision announces the model param.
+    assert.match(
+      describeClassifierDecision({
+        ...decision,
+        kind: "choose-thinking",
+        decision: { thinking: "xhigh", modelParam: "smart:xhigh", model: "prov/opus" },
+      }),
+      /model: smart:xhigh · typesafe\/jev-latest · 12ms/,
+    );
+  });
+
+  it("reports every subagent_choose_model request, successful or not", async () => {
+    const seen: ClassifierDecision[] = [];
+    const classifierModel = { provider: "typesafe", id: "jev-latest" };
+    const chatModels = [
+      { provider: "prov", id: "haiku", reasoning: false },
+      { provider: "prov", id: "opus", reasoning: true, thinkingLevelMap: { xhigh: null, max: null } },
+    ];
+    const registry = {
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifierModel] : chatModels),
+      getModelOfType: (type: string, provider: string, id: string) =>
+        type === "classifier"
+          ? classifierModel
+          : chatModels.find((model) => model.provider === provider && model.id === id),
+      getAvailableOfType: async () => [classifierModel],
+      classify: async () => ({
+        stopReason: "stop",
+        answers: {
+          preset: { type: "choice", choice: "smart", probabilities: { fast: 0.2, smart: 0.8 }, confidence: 0.8 },
+          thinking: { type: "choice", choice: "high", probabilities: { high: 0.6 }, confidence: 0.6 },
+        },
+      }),
+    } as any;
+    const config: ModelPresetConfig = {
+      presets: { fast: { model: "prov/haiku" }, smart: { model: "prov/opus" } },
+      defaultPreset: null,
+      classifierModel: null,
+      sources: [],
+    };
+
+    const outcome = await chooseSubagentModel({
+      registry,
+      config,
+      task: "Refactor the scheduler",
+      observer: (record) => seen.push(record),
+    });
+
+    assert.equal(outcome.ok, true);
+    // Two requests per decision: the tier, then the chosen model's levels.
+    assert.equal(seen.length, 2);
+    const [tier, record] = seen;
+    assert.equal(tier.kind, "choose-model");
+    assert.equal(tier.final, false);
+    assert.deepEqual(Object.keys(tier.questions), ["preset"]);
+    assert.equal(tier.decision.preset, "smart");
+    assert.equal(record.kind, "choose-thinking");
+    assert.equal(record.final, true);
+    assert.equal(record.classifier?.modelId, "jev-latest");
+    assert.deepEqual(Object.keys(record.questions), ["thinking"]);
+    assert.deepEqual(record.questions.thinking.criteria, ["off", "minimal", "low", "medium", "high"]);
+    // The classifier input is part of the record — without the task text the
+    // decision cannot be explained after the fact.
+    // The thinking call's input also names the model that won the tier.
+    assert.deepEqual(record.state, { task: "Refactor the scheduler", model: "prov/opus" });
+    assert.equal(record.stateTruncated, undefined);
+    assert.equal(record.answers.preset?.choice, "smart");
+    assert.equal(record.answers.thinking?.confidence, 0.6);
+    assert.equal(record.decision.preset, "smart");
+    assert.equal(record.decision.modelParam, "smart:high");
+    assert.equal(record.decision.clamped, false);
+    assert.equal(record.error, undefined);
+    assert.equal(typeof record.durationMs, "number");
+
+    // A failed request is recorded with its error, and still only once.
+    const failed: ClassifierDecision[] = [];
+    const failure = await chooseSubagentModel({
+      registry: {
+        ...registry,
+        classify: async () => ({ stopReason: "error", errorMessage: "gateway timeout" }),
+      } as any,
+      config,
+      task: "t",
+      observer: (record) => failed.push(record),
+    });
+
+    assert.equal(failure.ok, false);
+    assert.equal(failed.length, 1);
+    assert.equal(failed[0].kind, "choose-model");
+    assert.match(failed[0].error ?? "", /gateway timeout/);
+  });
+
+  it("reports the spawn-time thinking request", async () => {
+    const seen: ClassifierDecision[] = [];
+    const registry = {
+      getModelsOfType: (type: string) =>
+        type === "classifier"
+          ? [{ provider: "typesafe", id: "jev-latest" }]
+          : [{ provider: "prov", id: "opus", reasoning: true, thinkingLevelMap: { xhigh: null, max: null } }],
+      getAvailableOfType: async () => [{ provider: "typesafe", id: "jev-latest" }],
+      classify: async () => ({
+        stopReason: "stop",
+        answers: { thinking: { type: "choice", choice: "high", probabilities: { high: 0.9 } } },
+      }),
+    } as any;
+    const config: ModelPresetConfig = {
+      presets: {},
+      defaultPreset: null,
+      classifierModel: null,
+      sources: [],
+    };
+
+    const outcome = await chooseThinkingLevel({
+      registry,
+      config,
+      task: "Refactor the scheduler",
+      model: { provider: "prov", id: "opus" },
+      observer: (record) => seen.push(record),
+    });
+
+    assert.equal(outcome.ok && outcome.thinking, "high");
+    assert.equal(seen.length, 1);
+    const [record] = seen;
+    assert.equal(record.kind, "thinking");
+    assert.equal(record.model, "prov/opus");
+    assert.deepEqual(record.state, { task: "Refactor the scheduler", model: "prov/opus" });
+    assert.deepEqual(record.questions.thinking.criteria, ["off", "minimal", "low", "medium", "high"]);
+    assert.equal(record.answers.thinking?.choice, "high");
+    assert.deepEqual(record.decision, { thinking: "high", model: "prov/opus", clamped: false });
+    assert.equal(record.error, undefined);
+
+    // A model that cannot reason is not a request at all — nothing is reported.
+    const skipped: ClassifierDecision[] = [];
+    const quiet = await chooseThinkingLevel({
+      registry: {
+        ...registry,
+        getModelsOfType: () => [{ provider: "prov", id: "haiku", reasoning: false }],
+      } as any,
+      config,
+      task: "t",
+      model: { provider: "prov", id: "haiku" },
+      observer: (record) => skipped.push(record),
+    });
+
+    assert.equal(quiet.ok, true);
+    assert.deepEqual(skipped, []);
+  });
+  it("flags a task that was cut to the classifier input limit", async () => {
+    const seen: ClassifierDecision[] = [];
+    const classifierModel = { provider: "typesafe", id: "jev-latest" };
+    const chatModels = [{ provider: "prov", id: "opus", reasoning: true }];
+    const registry = {
+      getModelsOfType: (type: string) => (type === "classifier" ? [classifierModel] : chatModels),
+      getAvailableOfType: async () => [classifierModel],
+      classify: async () => ({
+        stopReason: "stop",
+        answers: { thinking: { type: "choice", choice: "medium", probabilities: { medium: 1 } } },
+      }),
+    } as any;
+
+    await chooseThinkingLevel({
+      registry,
+      config: { presets: {}, defaultPreset: null, classifierModel: null, sources: [] },
+      task: "x".repeat(20_000),
+      model: { provider: "prov", id: "opus" },
+      observer: (record) => seen.push(record),
+    });
+
+    assert.equal(seen.length, 1);
+    assert.equal(String(seen[0].state.task).length, 16_000);
+    assert.equal(seen[0].stateTruncated, true);
   });
 });
