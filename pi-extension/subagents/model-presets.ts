@@ -1,10 +1,11 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
-import { getAgentConfigDir } from "./pi-command.ts";
-
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
+import {
+  extensionConfigPaths,
+  mergeConfigObjects,
+  readConfigFile,
+  loadMergedConfigCached,
+  type ConfigPathOptions,
+  type LoadConfigOptions,
+} from "./config.ts";
 
 /**
  * The three canonical model tiers. They are ordinary preset names — the
@@ -13,16 +14,6 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
  * vocabulary.
  */
 export const CANONICAL_MODEL_PRESETS = ["fast", "balance", "smart"] as const;
-
-/** Directory (relative to a config root) that holds this extension's standalone config. */
-const EXTENSION_CONFIG_DIR = join("extensions", "pi-interactive-subagents");
-
-/**
- * Tolerated misspelling of the extensions directory. Users type
- * `.pi/extentions/...` often enough that silently ignoring the file would be
- * indistinguishable from "the feature does not work".
- */
-const EXTENSION_CONFIG_DIR_LEGACY = join("extentions", "pi-interactive-subagents");
 
 export interface ModelPreset {
   /** Model id/pattern passed to `--model`, e.g. `anthropic/claude-sonnet-4-5` or a `pi` pattern. */
@@ -181,79 +172,22 @@ function invalid(source: string, detail: string): never {
 }
 
 /**
- * Config files consulted for `modelPresets`, in ASCENDING priority order (each
- * later file is deep-merged over the previous ones):
- *
- *   1. the extension's own `config.json` (bundled defaults)
- *   2. `$PI_CODING_AGENT_DIR/extentions/pi-interactive-subagents/config.json` (legacy spelling)
- *   3. `$PI_CODING_AGENT_DIR/extensions/pi-interactive-subagents/config.json` (global)
- *   4. `<cwd>/.pi/extentions/pi-interactive-subagents/config.json` (legacy spelling)
- *   5. `<cwd>/.pi/extensions/pi-interactive-subagents/config.json` (project)
+ * Config files consulted for `modelPresets`, in ASCENDING priority order — the
+ * same list every other key uses (bundled < global < project, deep-merged).
  */
-export function modelPresetConfigPaths(
-  options: {
-    cwd?: string;
-    agentDir?: string;
-    env?: NodeJS.ProcessEnv;
-    packageRoot?: string;
-  } = {},
-): string[] {
-  const cwd = options.cwd ?? process.cwd();
-  const agentDir = options.agentDir ?? getAgentConfigDir(options.env ?? process.env);
-  const packageRoot = options.packageRoot ?? PACKAGE_ROOT;
-
-  return [
-    ...new Set([
-      join(packageRoot, "config.json"),
-      join(agentDir, EXTENSION_CONFIG_DIR_LEGACY, "config.json"),
-      join(agentDir, EXTENSION_CONFIG_DIR, "config.json"),
-      join(cwd, ".pi", EXTENSION_CONFIG_DIR_LEGACY, "config.json"),
-      join(cwd, ".pi", EXTENSION_CONFIG_DIR, "config.json"),
-    ]),
-  ];
+export function modelPresetConfigPaths(options: ConfigPathOptions = {}): string[] {
+  return extensionConfigPaths(options);
 }
 
-/**
- * Recursively merge `overlay` over `base`. Plain objects merge key by key;
- * arrays and scalars are replaced wholesale (a later `null` clears a key).
- */
-export function mergeConfigObjects(
-  base: Record<string, unknown>,
-  overlay: Record<string, unknown>,
-): Record<string, unknown> {
-  const merged: Record<string, unknown> = { ...base };
-  for (const [key, value] of Object.entries(overlay)) {
-    const previous = merged[key];
-    merged[key] =
-      isPlainObject(previous) && isPlainObject(value) ? mergeConfigObjects(previous, value) : value;
-  }
-  return merged;
-}
+/** Re-exported: the merge lives in config.ts and is shared by every key. */
+export { mergeConfigObjects };
 
 /**
  * Read one config file. Missing files yield `null`; malformed JSON or a
  * non-object root throws so a typo is never silently ignored.
  */
 export function readModelPresetConfigFile(configPath: string): Record<string, unknown> | null {
-  let rawConfig: string;
-  try {
-    rawConfig = readFileSync(configPath, "utf8");
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") return null;
-    throw error;
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawConfig) as unknown;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON in subagent config ${configPath}: ${detail}`);
-  }
-
-  if (!isPlainObject(parsed)) return invalid(configPath, "root must be an object");
-  return parsed;
+  return readConfigFile(configPath);
 }
 
 /**
@@ -349,29 +283,12 @@ export function parseModelPresetConfig(raw: unknown, sources: string[] = []): Mo
 }
 
 /**
- * Load and deep-merge every config layer. Returns an empty config when no
- * file exists; throws on malformed content.
+ * Load and deep-merge every config layer. Returns an empty config when no file
+ * exists; throws on malformed content. Reads through the shared change-detecting
+ * cache, so an edited file is picked up without a reload.
  */
-export function loadModelPresetConfig(
-  options: {
-    configPaths?: string[];
-    cwd?: string;
-    agentDir?: string;
-    env?: NodeJS.ProcessEnv;
-    packageRoot?: string;
-  } = {},
-): ModelPresetConfig {
-  const configPaths = options.configPaths ?? modelPresetConfigPaths(options);
-
-  const sources: string[] = [];
-  let merged: Record<string, unknown> = {};
-  for (const configPath of configPaths) {
-    const parsed = readModelPresetConfigFile(configPath);
-    if (!parsed) continue;
-    merged = mergeConfigObjects(merged, parsed);
-    sources.push(configPath);
-  }
-
+export function loadModelPresetConfig(options: LoadConfigOptions = {}): ModelPresetConfig {
+  const { merged, sources } = loadMergedConfigCached(options);
   return parseModelPresetConfig(merged, sources);
 }
 

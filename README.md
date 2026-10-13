@@ -136,7 +136,7 @@ These labels are no longer derived from session-file growth. Session JSONL is st
 
 #### Configuration
 
-Status display is controlled by `config.json` in the extension directory; the same file also accepts the optional `piBin` and `modelPresets` keys described below. Copy `config.json.example` to get started:
+Every setting lives in the same `config.json` — `status`, `piBin`, `modelPresets`, `classifierModel`. Copy `config.json.example` to get started:
 
 ```bash
 cp config.json.example config.json
@@ -158,13 +158,27 @@ cp config.json.example config.json
 
 `config.json` is gitignored so local overrides don't get committed.
 
+**Where it is read from.** One list serves every key, in ascending priority — each later file is deep-merged over the earlier ones, so a project file overrides a global one and both override the bundled defaults:
+
+| Priority | File |
+| --- | --- |
+| 1 (lowest) | `<extension>/config.json` — the bundled defaults next to this extension |
+| 2 | `$PI_CODING_AGENT_DIR/extentions/pi-interactive-subagents/config.json` (legacy spelling) |
+| 3 | `$PI_CODING_AGENT_DIR/extensions/pi-interactive-subagents/config.json` — global |
+| 4 | `<cwd>/.pi/extentions/pi-interactive-subagents/config.json` (legacy spelling) |
+| 5 (highest) | `<cwd>/.pi/extensions/pi-interactive-subagents/config.json` — project |
+
+- Scalar keys (`piBin`) take the **highest-priority** file that sets them; object keys (`modelPresets`) merge key by key, so a project file can override `modelPresets.fast` and inherit everything else.
+- **No reload needed.** Reads are cached by file `mtime`+size, so an edited `config.json` — including `status` — takes effect on the next spawn, tool call, or widget tick. `/reload` works too but is not required.
+- `status` is the tolerant key: a missing, malformed, or syntactically broken `config.json` falls back to the built-in defaults (`enabled: true`, four status lines) instead of failing the extension load. Everything else is read strictly, at spawn/tool time, where a typo can be reported.
+
 #### Pi command (`piBin`)
 
 Pi-backed subagents are launched with a hardcoded `pi` unless a command is configured. The optional top-level `piBin` string in `config.json` replaces it verbatim:
 
 - The value is a **full command line** — executable plus any arguments, e.g. `"piBin": "spi --no-skills --skill ~/.pi/skills"`. The extension appends its own arguments after it (`--session`, `-e …/subagent-done.ts`, `--model`/`--provider`, `--tools`, `--append-system-prompt`, the task prompt).
 - The `PI_SUBAGENT_PI_BIN` environment variable overrides `piBin`.
-- Config files are read in this order: `config.json` in the extension directory, then `$PI_CODING_AGENT_DIR/extensions/pi-interactive-subagents/config.json`. With neither present the default `pi` is used.
+- The value comes from the highest-priority file that declares it (see [Where it is read from](#configuration)); with none present the default `pi` is used.
 - **Shell aliases do not work.** Launch scripts run in a non-interactive `bash` (`#!/bin/bash`, invoked as `bash <script>`), so `.zshrc`/`.bashrc` aliases and functions are out of scope; `"piBin": "spi"` only works when `spi` is an executable on `PATH`. Use a real executable or a wrapper script.
 - `subagent_resume` launches with the same command, and the `Resume: …` hints printed in results/pings use it too.
 
@@ -211,7 +225,7 @@ model: fast
 - A literal `model: fast|balance|smart` with no matching preset is rejected at spawn time with an actionable error — it would otherwise kill the child pane with "No models match pattern smart".
 - `subagents_list` shows the resolved model, e.g. `[smart → anthropic/claude-opus-4-1]` (and `[balance (default) → …]` for agents that only inherit `defaultPreset`).
 - Claude Code agents (`cli: claude`) ignore `defaultPreset`: their `--model` expects Claude model names, not pi model targets. An explicit preset reference in frontmatter still applies.
-- Files are **deep-merged** in ascending priority: `config.json` in the extension directory → `$PI_CODING_AGENT_DIR/extensions/pi-interactive-subagents/config.json` (global) → `<session-cwd>/.pi/extensions/pi-interactive-subagents/config.json` (project). Only the keys a layer sets are overridden, so a project file may override `modelPresets.fast` and keep the global `modelPresets.smart`.
+- Presets come from the same layered lookup as every other key ([Where it is read from](#configuration)): the project layer deep-merges over the global one, so a project file may override `modelPresets.fast` and keep the global `modelPresets.smart`.
 - `extentions/` (the common misspelling) is accepted as a directory alias; the correctly spelled `extensions/` path wins when both exist.
 
 #### Picking a tier with a classifier (`subagent_choose_model`)

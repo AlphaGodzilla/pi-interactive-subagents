@@ -585,7 +585,7 @@ describe("status.ts", () => {
 
   it("loads a valid config file", () => {
     const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadStatusConfig(examplePath);
+    const config = loadStatusConfig({ configPaths: [examplePath] });
 
     assert.deepEqual(config, {
       enabled: true,
@@ -593,17 +593,23 @@ describe("status.ts", () => {
     });
   });
 
-  it("loads the shared example when local config is absent", () => {
+  it("lays a later layer over an earlier one", () => {
     withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
+      const base = join(dir, "config.json");
+      const project = join(dir, "project.json");
+      writeFileSync(base, JSON.stringify({ status: { enabled: false } }));
+      writeFileSync(project, JSON.stringify({ status: { enabled: true } }));
 
-      const config = loadStatusConfig(join(dir, "config.json"), examplePath);
+      assert.deepEqual(loadStatusConfig({ configPaths: [base, project] }), {
+        enabled: true,
+        lineLimit: 4,
+      });
+    });
+  });
 
-      assert.deepEqual(config, {
+  it("falls back to the defaults when no config file exists", () => {
+    withTempDir((dir) => {
+      assert.deepEqual(loadStatusConfig({ configPaths: [join(dir, "missing.json")] }), {
         enabled: true,
         lineLimit: 4,
       });
@@ -621,41 +627,36 @@ describe("status.ts", () => {
     );
   });
 
-  it("reports when neither local nor shared config exists", () => {
+  it("tolerates a broken shared config instead of failing to load", () => {
     withTempDir((dir) => {
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
-        /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
-      );
+      // Status is cosmetic: a syntax error (or a wrong shape) must not stop the
+      // extension from loading, it just means the defaults apply.
+      const configPath = join(dir, "config.json");
+
+      writeFileSync(configPath, "{\n");
+      assert.deepEqual(loadStatusConfig({ configPaths: [configPath] }), {
+        enabled: true,
+        lineLimit: 4,
+      });
+
+      writeFileSync(configPath, JSON.stringify({ status: { enabled: "yes" } }));
+      assert.deepEqual(loadStatusConfig({ configPaths: [configPath] }), {
+        enabled: true,
+        lineLimit: 4,
+      });
     });
   });
 
-  it("reports invalid JSON from the shared example path", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(examplePath, "{\n");
-
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), examplePath),
-        /Invalid JSON in subagent config .*config\.json\.example/,
-      );
-    });
-  });
-
-  it("fails on invalid local config instead of falling back to the shared example", () => {
+  it("re-reads a config file after it changes", () => {
     withTempDir((dir) => {
       const configPath = join(dir, "config.json");
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(configPath, "{\n");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
+      writeFileSync(configPath, JSON.stringify({ status: { enabled: false } }));
+      assert.equal(loadStatusConfig({ configPaths: [configPath] }).enabled, false);
 
-      assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
-        /Invalid JSON in subagent config .*config\.json/,
-      );
+      // A different size guarantees a changed cache signature, so the test does
+      // not depend on mtime granularity.
+      writeFileSync(configPath, JSON.stringify({ status: { enabled: true }, extra: 1 }));
+      assert.equal(loadStatusConfig({ configPaths: [configPath] }).enabled, true);
     });
   });
 
@@ -4041,7 +4042,7 @@ describe("pi-command.ts", () => {
     });
   });
 
-  it("reads the first config file that declares piBin", () => {
+  it("lets the highest-priority config file win", () => {
     withTempDir((dir) => {
       const first = join(dir, "config.json");
       const second = join(dir, "extensions", "pi-interactive-subagents", "config.json");
@@ -4054,10 +4055,9 @@ describe("pi-command.ts", () => {
 
       const resolved = resolvePiCommand({ env: {}, configPaths: [first, second] });
 
-      assert.deepEqual(resolved, {
-        command: "spi --no-skills --skill ~/.pi/skills",
-        source: first,
-      });
+      // `configPaths` is ascending priority (as everywhere else): the project
+      // layer overrides the global one instead of being shadowed by it.
+      assert.deepEqual(resolved, { command: "later-command", source: second });
     });
   });
 
@@ -4103,16 +4103,19 @@ describe("pi-command.ts", () => {
     });
   });
 
-  it("orders candidates extension-dir first and follows PI_CODING_AGENT_DIR", () => {
-    withTempDir((dir) => {
-      const agentDir = join(dir, "agent2");
-      const paths = piCommandConfigPaths(agentDir);
+  it("uses the shared layered candidates and follows PI_CODING_AGENT_DIR", () => {
+    const agentDir = "/tmp/agent2";
+    const paths = piCommandConfigPaths(agentDir);
 
-      assert.equal(paths.length, 2);
-      assert.equal(paths[0], fileURLToPath(new URL("../config.json", import.meta.url)));
-      assert.equal(paths[1], join(agentDir, "extensions", "pi-interactive-subagents", "config.json"));
-      assert.equal(getAgentConfigDir({ PI_CODING_AGENT_DIR: agentDir }), agentDir);
-    });
+    // Same list (and order) every other key reads: bundled < global < project.
+    assert.deepEqual(paths, [
+      fileURLToPath(new URL("../config.json", import.meta.url)),
+      join(agentDir, "extentions", "pi-interactive-subagents", "config.json"),
+      join(agentDir, "extensions", "pi-interactive-subagents", "config.json"),
+      join(process.cwd(), ".pi", "extentions", "pi-interactive-subagents", "config.json"),
+      join(process.cwd(), ".pi", "extensions", "pi-interactive-subagents", "config.json"),
+    ]);
+    assert.equal(getAgentConfigDir({ PI_CODING_AGENT_DIR: agentDir }), agentDir);
   });
 });
 

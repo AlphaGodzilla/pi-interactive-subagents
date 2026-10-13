@@ -1,15 +1,9 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { loadMergedConfigCached, type LoadConfigOptions } from "./config.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
-
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 /**
  * Kind shown for a subagent entry.
@@ -49,6 +43,12 @@ export interface StatusConfig {
   enabled: boolean;
   lineLimit: number;
 }
+
+/** What status display uses when config.json says nothing (or cannot be read). */
+export const DEFAULT_STATUS_CONFIG: StatusConfig = {
+  enabled: true,
+  lineLimit: DEFAULT_STATUS_LINE_LIMIT,
+};
 
 export type StatusObservation =
   | {
@@ -177,42 +177,22 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
-function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
+/**
+ * Status display settings, read lazily (never at import time) from the same
+ * layered config every other key uses.
+ *
+ * Tolerance is deliberate: status is cosmetic, so a missing — or even a
+ * syntactically broken — shared `config.json` must not stop the extension from
+ * loading. It falls back to the defaults; every other key still reads the same
+ * files strictly, at spawn/tool time, where a typo can be reported properly.
+ */
+export function loadStatusConfig(options: LoadConfigOptions = {}): StatusConfig {
   try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code !== "ENOENT") throw error;
+    const { merged } = loadMergedConfigCached(options);
+    return parseStatusConfig(merged);
+  } catch {
+    return { ...DEFAULT_STATUS_CONFIG };
   }
-
-  try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
-  } catch (error) {
-    const errno = error as NodeJS.ErrnoException;
-    if (errno.code === "ENOENT") {
-      throw new Error(
-        `Missing subagent status config. Expected ${configPath} or ${examplePath}.`,
-      );
-    }
-    throw error;
-  }
-}
-
-export function loadStatusConfig(
-  configPath = DEFAULT_STATUS_CONFIG_PATH,
-  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
-): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawConfig) as unknown;
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
-  }
-
-  return parseStatusConfig(parsed, sourcePath);
 }
 
 export function formatElapsedDuration(ms: number): string {

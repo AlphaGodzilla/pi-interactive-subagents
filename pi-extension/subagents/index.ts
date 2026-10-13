@@ -56,6 +56,7 @@ import {
   formatTransitionLine,
   observeStatus,
   loadStatusConfig,
+  type StatusConfig,
 } from "./status.ts";
 import { DEFAULT_PI_COMMAND, getAgentConfigDir, resolvePiCommand } from "./pi-command.ts";
 import {
@@ -637,7 +638,14 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
+/**
+ * Status display settings, read lazily and cached by file mtime — never at
+ * import time, so a broken config cannot stop the extension from loading, and an
+ * edited one is picked up on the next widget tick without a reload.
+ */
+function statusSettings(): StatusConfig {
+  return loadStatusConfig({ cwd: process.cwd() });
+}
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -871,7 +879,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
     const left = ` ${elapsed}  ${agent.name}${agentTag} `;
     const snapshot = classifyStatus(agent.statusState, Date.now());
-    const right = statusConfig.enabled
+    const right = statusSettings().enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
         ? " running… "
@@ -1700,7 +1708,7 @@ function handleSubagentsStatus(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+  if (!statusSettings().enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1738,11 +1746,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+      const capped = capStatusLines(transitionLines, statusSettings().lineLimit);
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusWake(transitionLines, statusConfig.lineLimit, stalledTransition),
+          content: formatStatusWake(transitionLines, statusSettings().lineLimit, stalledTransition),
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow, stalled: stalledTransition },
         },
