@@ -5026,17 +5026,23 @@ describe("subagent_choose_model classifier", () => {
       const tool = registeredTools.find((entry) => entry.name === "subagent_choose_model");
 
       const notifications: string[] = [];
-      const result = await tool.execute("call-1", { task: "Hard refactor" }, undefined, undefined, {
-        cwd: dir,
+      const result = await tool.execute(
+        "call-1",
+        { task: "Hard refactor", scope: "71 GET routes", risk: "high", deliverable: "docs" },
+        undefined,
+        undefined,
+        {
+          cwd: dir,
         modelRegistry: makeRegistry({
           answers: {
             preset: { type: "choice", choice: "smart", probabilities: { fast: 0.2, smart: 0.8 } },
             thinking: { type: "choice", choice: "high", probabilities: { high: 1 } },
           },
         }),
-        sessionManager: { getSessionDir: () => dir, getSessionId: () => "session-1" },
-        ui: { notify: (message: string) => notifications.push(message) },
-      });
+          sessionManager: { getSessionDir: () => dir, getSessionId: () => "session-1" },
+          ui: { notify: (message: string) => notifications.push(message) },
+        },
+      );
 
       assert.match(result.content[0].text, /model: "smart:high"/);
       assert.match(result.content[0].text, /Model thinking levels: off, minimal, low, medium, high/);
@@ -5066,6 +5072,14 @@ describe("subagent_choose_model classifier", () => {
       assert.equal(records[0].state.task, "Hard refactor");
       assert.equal(records[1].state.task, "Hard refactor");
       assert.equal(records[1].state.model, "prov/opus");
+      // The caller's facts and the locally computed ones are both logged.
+      for (const record of records) {
+        assert.equal(record.state.scope, "71 GET routes");
+        assert.equal(record.state.risk, "high");
+        assert.equal(record.state.deliverable, "docs");
+        assert.equal(record.state.taskChars, "Hard refactor".length);
+        assert.equal(record.state.cwd, dir);
+      }
       // One notification per completed decision (the final record only).
       assert.equal(notifications.length, 1);
       assert.match(notifications[0], /model: smart:high · typesafe\/jev-latest · \d+ms/);
@@ -5448,6 +5462,40 @@ describe("inherited-model thinking selection", () => {
 });
 
 
+describe("classifier context", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("derives read-only and size signals from the agent and the task", () => {
+    assert.deepEqual(
+      testApi.classifierContext({
+        task: "12345",
+        agentDefs: { tools: "read, bash, grep" },
+        cwd: "/repo/mybitx-server",
+        parentModel: { provider: "cpa_mybitx", modelId: "mybitx/gpt-6.1-sol" },
+      }),
+      {
+        taskChars: 5,
+        agentTools: "read, bash, grep",
+        readOnly: true,
+        cwd: "/repo/mybitx-server",
+        parentModel: "cpa_mybitx/mybitx/gpt-6.1-sol",
+      },
+    );
+
+    // A writer tool set is not read-only; skills ride along when present.
+    assert.deepEqual(testApi.classifierContext({ task: "x", agentDefs: { tools: "read, edit", skills: "code-review" } }), {
+      taskChars: 1,
+      agentTools: "read, edit",
+      readOnly: false,
+      agentSkills: "code-review",
+    });
+
+    // No agent definition (or no tool restriction): nothing to claim.
+    assert.deepEqual(testApi.classifierContext({ task: "x", agentDefs: null }), { taskChars: 1 });
+    assert.deepEqual(testApi.classifierContext({ task: "x", agentDefs: { description: "no tools" } }), { taskChars: 1 });
+  });
+});
+
 describe("classifier decision observability", () => {
   const decision: ClassifierDecision = {
     at: "2026-10-12T00:00:00.000Z",
@@ -5621,6 +5669,9 @@ describe("classifier decision observability", () => {
     assert.equal(record.kind, "thinking");
     assert.equal(record.model, "prov/opus");
     assert.deepEqual(record.state, { task: "Refactor the scheduler", model: "prov/opus" });
+    // The question is phrased around failure cost and verification depth
+    // (`criteria` records the offered labels; their wording lives in the code).
+    assert.match(String(record.questions.thinking.instructions), /verification/);
     assert.deepEqual(record.questions.thinking.criteria, ["off", "minimal", "low", "medium", "high"]);
     assert.equal(record.answers.thinking?.choice, "high");
     assert.deepEqual(record.decision, { thinking: "high", model: "prov/opus", clamped: false });

@@ -550,6 +550,39 @@ function makeClassifierObserver(options: {
   };
 }
 
+/**
+ * Machine-readable facts for the classifier, next to the prose task text.
+ *
+ * The task alone describes *what* to do, not how hard it is: these are the
+ * signals that make the tier/thinking questions answerable — a read-only tool
+ * set, the working directory, the parent's model, and the size of the task text.
+ */
+function classifierContext(input: {
+  task: string;
+  agentDefs?: AgentDefinition | null;
+  cwd?: string;
+  parentModel?: ParentModelSpec | null;
+}): Record<string, unknown> {
+  const context: Record<string, unknown> = { taskChars: input.task.length };
+
+  const tools = input.agentDefs?.tools?.trim();
+  if (tools) {
+    context.agentTools = tools;
+    // A tool set without a writer is a read-only agent — the strongest
+    // difficulty signal we can compute locally.
+    context.readOnly = !tools.split(",").some((tool) => {
+      const name = tool.trim().toLowerCase();
+      return name === "edit" || name === "write";
+    });
+  }
+  if (input.agentDefs?.skills) context.agentSkills = input.agentDefs.skills;
+  if (input.cwd) context.cwd = input.cwd;
+  if (input.parentModel) {
+    context.parentModel = `${input.parentModel.provider}/${input.parentModel.modelId}`;
+  }
+  return context;
+}
+
 /** ` (p=0.62)` for the picked label, when the classifier reported probabilities. */
 function formatProbability(probabilities: Record<string, number> | undefined, label: string): string {
   const value = probabilities?.[label];
@@ -1760,6 +1793,7 @@ export const __test__ = {
   runningSubagents,
   formatElapsed,
   formatModelBadge,
+  classifierContext,
 };
 
 function startWidgetRefresh() {
@@ -2056,6 +2090,12 @@ async function launchSubagent(
       agentDescription: agentDefs?.description,
       task: params.task,
       model: childModel,
+      context: classifierContext({
+        task: params.task,
+        agentDefs,
+        cwd: targetCwdForSession,
+        parentModel: resolveParentModel(sessionFile),
+      }),
       observer: makeClassifierObserver({
         artifactDir,
         ...(ctx.ui ? { notify: (message, type) => ctx.ui!.notify(message, type) } : {}),
@@ -2935,6 +2975,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "Agent template you plan to spawn (e.g. \"worker\"); its description is passed to the classifier for context.",
           }),
         ),
+        scope: Type.Optional(
+          Type.String({
+            description:
+              "How much surface the task covers, in your own words with numbers where you have them — e.g. \"71 GET routes\", \"1 controller + its service\", \"whole repo\". This is the strongest size signal the classifier gets; without it a 71-route sweep and a single-route check look alike.",
+          }),
+        ),
+        risk: Type.Optional(
+          Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], {
+            description:
+              "How costly a wrong answer would be: `low` = caught immediately by a command or test, `medium` = caught during the work, `high` = it can look right and needs verification against source/invariants.",
+          }),
+        ),
+        deliverable: Type.Optional(
+          Type.Union([Type.Literal("report"), Type.Literal("docs"), Type.Literal("code")], {
+            description: "What the subagent produces: a read-only report, documentation/model edits, or code changes.",
+          }),
+        ),
       }),
 
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -2954,7 +3011,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Classifier decisions are observable: one line per request in the
         // session's classifier-decisions.jsonl, plus a UI notification.
         const sessionManager = (
-          ctx as { sessionManager?: { getSessionDir(): string; getSessionId(): string } } | undefined
+          ctx as
+            | {
+                sessionManager?: {
+                  getSessionDir(): string;
+                  getSessionId(): string;
+                  getSessionFile?(): string | undefined;
+                };
+              }
+            | undefined
         )?.sessionManager;
         const observer = makeClassifierObserver({
           ...(sessionManager
@@ -2968,12 +3033,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ...(ctx?.ui ? { notify: (message, type) => ctx.ui.notify(message, type) } : {}),
         });
 
+        const sessionFile = sessionManager?.getSessionFile?.() ?? null;
         const outcome = await chooseSubagentModel({
           registry,
           config,
           agentName: params.agent,
           agentDescription: agentDefs?.description,
           task: params.task,
+          context: {
+            ...classifierContext({
+              task: params.task,
+              agentDefs,
+              cwd: ctx?.cwd,
+              parentModel: sessionFile ? resolveParentModel(sessionFile) : null,
+            }),
+            ...(params.scope ? { scope: params.scope } : {}),
+            ...(params.risk ? { risk: params.risk } : {}),
+            ...(params.deliverable ? { deliverable: params.deliverable } : {}),
+          },
           signal,
           observer,
         });

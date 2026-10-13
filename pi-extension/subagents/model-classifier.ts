@@ -104,6 +104,12 @@ function classifierState(input: {
   agentName?: string;
   agentDescription?: string;
   model?: string;
+  /**
+   * Extra machine-readable facts the caller knows (scope, risk, deliverable,
+   * agent tools, cwd, parent model, ...). Prose task text alone carries no
+   * difficulty signal; these are what make the question answerable.
+   */
+  context?: Record<string, unknown>;
 }): {
   state: Record<string, unknown>;
   truncated: boolean;
@@ -114,6 +120,9 @@ function classifierState(input: {
   if (input.agentName) state.agent = input.agentName;
   if (input.agentDescription) state.agentDescription = input.agentDescription;
   if (input.model) state.model = input.model;
+  for (const [key, value] of Object.entries(input.context ?? {})) {
+    if (value !== undefined) state[key] = value;
+  }
   const truncated = input.task.length > MAX_CLASSIFIER_TASK_CHARS;
   return { state, truncated, fields: { state, ...(truncated ? { stateTruncated: true } : {}) } };
 }
@@ -130,13 +139,13 @@ const CANONICAL_PRESET_CRITERIA: Record<string, string> = {
 
 /** What each thinking level is for, shown to the classifier as its criteria. */
 const THINKING_CRITERIA: Record<ThinkingLevelName, string> = {
-  off: "No extended reasoning — mechanical work with nothing to weigh",
-  minimal: "A trace of reasoning — trivial decisions",
-  low: "Light reasoning — straightforward work with a few small choices",
-  medium: "Moderate reasoning — multi-step work with trade-offs",
-  high: "Heavy reasoning — subtle correctness, design, or debugging",
-  xhigh: "Very heavy reasoning — only the hardest problems",
-  max: "Maximum reasoning budget — rare and expensive",
+  off: "Nothing to weigh: the answer is mechanical or already fixed by the task",
+  minimal: "One trivial choice; a wrong guess shows up immediately",
+  low: "Straightforward work; a mistake surfaces in the same step (a command, a test, a grep)",
+  medium: "Multi-step work with a few trade-offs; mistakes usually surface while working",
+  high: "Subtle correctness or invariants; a wrong answer can look right and must be verified by re-reading source",
+  xhigh: "Several facts must hold at once (protocol semantics, transactions, concurrency, cross-layer wiring)",
+  max: "Novel design or debugging where each extra pass of reasoning pays off",
 };
 
 
@@ -253,10 +262,18 @@ function pickChoice(
 function thinkingQuestion(levels: readonly ThinkingLevelName[]): Record<string, unknown> {
   return {
     type: "choice",
-    instructions: "How much extended reasoning effort does this subagent task need?",
+    instructions:
+      "How costly would a wrong or shallow answer be for this task, and how deep must the " +
+      "verification go? Judge the task text together with the facts in `state` (scope, risk, " +
+      "deliverable, agent tools, model).",
     criteria: Object.fromEntries(levels.map((level) => [level, THINKING_CRITERIA[level]])),
   };
 }
+
+const PRESET_QUESTION_INSTRUCTIONS =
+  "Which model tier fits this task's shape — read-only reconnaissance of a named surface, " +
+  "implementation against a spec, or verification whose failure cost is high? Weigh the task " +
+  "text together with the facts in `state` (scope, risk, deliverable, agent tools).";
 
 /**
  * Union of the thinking levels the candidate models support, in ascending order
@@ -378,6 +395,8 @@ export async function chooseSubagentModel(input: {
   agentName?: string;
   agentDescription?: string;
   task: string;
+  /** Extra machine-readable facts for the classifier (scope, risk, tools, ...). */
+  context?: Record<string, unknown>;
   signal?: AbortSignal;
   observer?: ClassifierObserver;
 }): Promise<ChooseSubagentModelResult> {
@@ -399,12 +418,13 @@ export async function chooseSubagentModel(input: {
     task: input.task,
     agentName: input.agentName,
     agentDescription: input.agentDescription,
+    context: input.context,
   });
   const presetQuestion =
     presetNames.length > 1
       ? {
           type: "choice",
-          instructions: "Which model tier should handle this subagent task?",
+          instructions: PRESET_QUESTION_INSTRUCTIONS,
           criteria: Object.fromEntries(
             presetNames.map((name) => [name, presetCriteria(input.config.presets[name], name)]),
           ),
@@ -541,6 +561,7 @@ export async function chooseSubagentModel(input: {
     agentName: input.agentName,
     agentDescription: input.agentDescription,
     model: preset.model,
+    context: input.context,
   });
   const thinkingQuestions = askThinking ? { thinking: thinkingQuestion(levels) } : {};
 
@@ -688,6 +709,8 @@ export async function chooseThinkingLevel(input: {
   task: string;
   /** The model the child will run on; decides which levels are offered. */
   model?: { provider?: string; id?: string };
+  /** Extra machine-readable facts for the classifier (scope, risk, tools, ...). */
+  context?: Record<string, unknown>;
   signal?: AbortSignal;
   observer?: ClassifierObserver;
 }): Promise<ChooseThinkingLevelResult> {
@@ -723,6 +746,7 @@ export async function chooseThinkingLevel(input: {
     agentName: input.agentName,
     agentDescription: input.agentDescription,
     model: reference,
+    context: input.context,
   });
   const stateFields = inputState.fields;
 
