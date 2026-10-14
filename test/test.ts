@@ -976,7 +976,7 @@ describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
   it("loads session-mode from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
       writeAgentFile(
         projectAgentsDir,
         "lineage-mode-test-agent",
@@ -4985,6 +4985,74 @@ describe("subagent_choose_model classifier", () => {
     assert.equal(seenOverride.context.questions.preset.criteria.fast, "只做机械改动");
   });
 
+  it("sends the agent's role text and tool set to the classifier", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "ctx-role-agent",
+        [
+          "name: ctx-role-agent",
+          "description: Reviews things",
+          "tools: read, bash",
+          "skills: code-review",
+          "system-prompt: append",
+          "session-mode: lineage-only",
+        ].join("\n"),
+        "You are the context-role reviewer. Check invariants by re-reading source.",
+      );
+
+      const configDir = join(projectDir, ".pi", "extensions", "pi-interactive-subagents");
+      mkdirSync(configDir, { recursive: true });
+      writeFileSync(
+        join(configDir, "config.json"),
+        JSON.stringify({
+          modelPresets: { fast: { model: "prov/haiku" }, smart: { model: "prov/opus" } },
+          classifierModel: "typesafe/jev-latest",
+        }),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((entry) => entry.name === "subagent_choose_model");
+
+      await tool.execute(
+        "call-1",
+        { agent: "ctx-role-agent", task: "Review the settings routes", scope: "2 GET routes" },
+        undefined,
+        undefined,
+        {
+          cwd: projectDir,
+          modelRegistry: makeRegistry({
+            answers: {
+              preset: { choice: "smart", probabilities: { smart: 1 } },
+              thinking: { choice: "high", probabilities: { high: 1 } },
+            },
+          }),
+          sessionManager: { getSessionDir: () => projectDir, getSessionId: () => "ctx-role" },
+        },
+      );
+
+      // The decision record (with the classifier input) is the log line.
+      const logPath = join(projectDir, "artifacts", "ctx-role", "classifier-decisions.jsonl");
+      const records = readFileSync(logPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const state = records[0].state;
+      assert.match(String(state.agentRole), /context-role reviewer/);
+      assert.equal(state.agentTools, "read, bash");
+      assert.equal(state.readOnly, true);
+      assert.equal(state.agentSkills, "code-review");
+      assert.equal(state.systemPromptMode, "append");
+      assert.equal(state.agentSessionMode, "lineage-only");
+      assert.equal(state.scope, "2 GET routes");
+      assert.equal(state.taskChars, "Review the settings routes".length);
+      // The tool cannot know the spawn prompt, so it reports the task length
+      // only — `promptChars` appears for spawn-time decisions.
+      assert.equal(state.promptChars, undefined);
+    });
+  });
+
   it("registers subagent_choose_model as a spawning tool", () => {
     const { api, registeredTools } = createMockExtensionApi();
 
@@ -5517,6 +5585,37 @@ describe("classifier context", () => {
     // No agent definition (or no tool restriction): nothing to claim.
     assert.deepEqual(testApi.classifierContext({ task: "x", agentDefs: null }), { taskChars: 1 });
     assert.deepEqual(testApi.classifierContext({ task: "x", agentDefs: { description: "no tools" } }), { taskChars: 1 });
+  });
+
+  it("carries the role text and the real prompt length", () => {
+    const long = "x".repeat(5_000);
+    const promptText = "role block\n\nwrapper\n\n" + "y".repeat(1_800);
+    const context = testApi.classifierContext({
+      task: "short task",
+      promptText,
+      agentDefs: {
+        body: "You are the reviewer.",
+        tools: "read, bash",
+        skills: "code-review",
+        systemPromptMode: "append",
+        sessionMode: "lineage-only",
+      },
+    });
+
+    assert.equal(context.taskChars, "short task".length);
+    // The gap to `taskChars` is the whole point: the classifier saw the short
+    // argument while the subagent got the long prompt.
+    assert.equal(context.promptChars, promptText.length);
+    assert.equal(context.agentRole, "You are the reviewer.");
+    assert.equal(context.systemPromptMode, "append");
+    assert.equal(context.agentSessionMode, "lineage-only");
+    assert.equal(context.agentSkills, "code-review");
+    assert.equal(context.readOnly, true);
+
+    // A long role text is cut with an explicit marker.
+    const cut = testApi.classifierContext({ task: "t", agentDefs: { body: long } });
+    assert.match(String(cut.agentRole), /…\[truncated\]$/);
+    assert.ok(String(cut.agentRole).length < 4_100);
   });
 });
 

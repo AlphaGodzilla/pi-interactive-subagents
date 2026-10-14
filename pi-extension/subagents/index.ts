@@ -560,11 +560,26 @@ function makeClassifierObserver(options: {
  */
 function classifierContext(input: {
   task: string;
+  /**
+   * The prompt the subagent will actually receive (role block + wrapper +
+   * task). Only the spawn path knows it; decision logs without `promptChars`
+   * came from the tool, before the caller composed the spawn.
+   */
+  promptText?: string;
   agentDefs?: AgentDefinition | null;
   cwd?: string;
   parentModel?: ParentModelSpec | null;
 }): Record<string, unknown> {
   const context: Record<string, unknown> = { taskChars: input.task.length };
+  // The gap between these two is exactly the "the classifier saw 8% of the
+  // prompt" problem: it is logged so it stays measurable.
+  if (input.promptText) context.promptChars = input.promptText.length;
+
+  // The role the subagent will be told to play — the agent body is injected as
+  // its system prompt or role block, and the classifier otherwise only sees a
+  // one-line description.
+  const role = input.agentDefs?.body?.trim();
+  if (role) context.agentRole = truncateToChars(role, CLASSIFIER_AGENT_ROLE_CHARS);
 
   const tools = input.agentDefs?.tools?.trim();
   if (tools) {
@@ -577,11 +592,21 @@ function classifierContext(input: {
     });
   }
   if (input.agentDefs?.skills) context.agentSkills = input.agentDefs.skills;
+  if (input.agentDefs?.systemPromptMode) context.systemPromptMode = input.agentDefs.systemPromptMode;
+  if (input.agentDefs?.sessionMode) context.agentSessionMode = input.agentDefs.sessionMode;
   if (input.cwd) context.cwd = input.cwd;
   if (input.parentModel) {
     context.parentModel = `${input.parentModel.provider}/${input.parentModel.modelId}`;
   }
   return context;
+}
+
+/** Longest agent body handed to the classifier; the rest is dropped. */
+const CLASSIFIER_AGENT_ROLE_CHARS = 4_000;
+
+/** Truncate with an explicit marker, so the classifier can tell it was cut. */
+function truncateToChars(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit)}\n…[truncated]`;
 }
 
 /** ` (p=0.62)` for the picked label, when the classifier reported probabilities. */
@@ -2096,10 +2121,13 @@ async function launchSubagent(
       config: modelPresets,
       agentName: params.agent,
       agentDescription: agentDefs?.description,
-      task: params.task,
+      // The prompt the child actually receives (role block + wrapper + task),
+      // not the bare task argument — same text, same decision basis.
+      task: fullTask,
       model: childModel,
       context: classifierContext({
         task: params.task,
+        promptText: fullTask,
         agentDefs,
         cwd: targetCwdForSession,
         parentModel: resolveParentModel(sessionFile),
@@ -2964,18 +2992,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "Ask a classifier model which model tier and thinking level a subagent you are about to spawn should use. " +
         "Tiers come from `modelPresets` in config.json (fast/balance/smart, ...); a preset that pins its own `thinking` uses it as is, otherwise the classifier picks the level (clamped to what the chosen tier's model actually supports). " +
-        "Returns the ready-to-use value — e.g. `smart:high` — to pass as the `model` parameter of the `subagent` tool, which then selects the smart preset with thinking level high. " +
+        "Returns the ready-to-use value — e.g. `balance:high` — to pass as the `model` parameter of the `subagent` tool, which then selects the balance preset with thinking level high. " +
         "Costs one classifier call; use it when the model choice is not obvious, then spawn with the returned value. " +
         "It does NOT spawn anything and does not pick the task's content.",
       promptSnippet:
         "Pick a `modelPresets` tier + thinking level for a subagent via a classifier model; returns the `model: \"<preset>:<thinking>\"` value to pass to `subagent`.",
       promptGuidelines: [
-        "Call subagent_choose_model when the right model tier/thinking level for a spawn is not obvious, then pass its returned `modelParam` (e.g. \"smart:high\") as the `model` parameter of the `subagent` tool.",
+        "Call subagent_choose_model when the right model tier/thinking level for a spawn is not obvious, then pass its returned `modelParam` (e.g. \"balance:high\") as the `model` parameter of the `subagent` tool.",
+        "Pass the SAME task text you will give the `subagent` tool (scope, deliverable, invariants) — a condensed summary is thinner than the prompt the subagent receives, and the tier decision is only as good as that text.",
         "subagent_choose_model needs `modelPresets` in config.json and a classifier model (configured `classifierModel`, else the first available one). It costs one classifier call — never call it in a loop.",
       ],
       parameters: Type.Object({
         task: Type.String({
-          description: "The task/prompt you intend to give the subagent. This text is what the classifier judges.",
+          description:
+            "The task/prompt you intend to give the subagent — pass the SAME text you will hand to `subagent`, not a summary. This text is what the classifier judges, so a one-line version makes the decision worse: keep the scope, the deliverable, and the specific invariants or risks.",
         }),
         agent: Type.Optional(
           Type.String({
