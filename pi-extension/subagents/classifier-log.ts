@@ -61,5 +61,8 @@ export function describeClassifierDecision(decision: ClassifierDecision): string
 
   const preset = decision.decision.preset;
   const modelParam = decision.decision.modelParam;
-  return `model: ${modelParam ?? preset ?? "?"} · ${who} · ${timing}`;
+  // Surface an escalation-policy hold: the classifier's pick was not applied.
+  const requested = decision.decision.requestedPreset;
+  const held = requested && requested !== preset ? ` (held; classifier asked ${String(requested)})` : "";
+  return `model: ${modelParam ?? preset ?? "?"}${held} · ${who} · ${timing}`;
 }

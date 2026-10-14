@@ -3101,9 +3101,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         const choice = outcome.choice;
-        const presetP = formatProbability(choice.presetProbabilities, choice.preset);
+        // With an escalation policy the classifier's own pick can be held back;
+        // say so instead of pretending it chose the applied tier.
+        const picked = choice.requestedPreset ?? choice.preset;
+        const presetP = formatProbability(choice.presetProbabilities, picked);
+        const heldAt =
+          choice.requestedPreset && choice.policy
+            ? `; held at the preferred tier "${choice.preset}" (escalateAt ${choice.policy.escalateAt})`
+            : "";
         const lines = [
-          `Classifier ${choice.classifier.provider}/${choice.classifier.modelId} picked preset "${choice.preset}"${presetP}` +
+          `Classifier ${choice.classifier.provider}/${choice.classifier.modelId} picked preset "${picked}"${presetP}${heldAt}` +
             (choice.thinking
               ? ` with thinking "${choice.thinking}"${formatProbability(choice.thinkingProbabilities, choice.thinking)}`
               : " and no thinking level"),

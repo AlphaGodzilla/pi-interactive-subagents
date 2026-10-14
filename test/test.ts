@@ -4125,6 +4125,7 @@ describe("model presets (config.json)", () => {
     presets: {},
     defaultPreset: null,
     classifierModel: null,
+    policy: null,
     sources: [],
   });
 
@@ -4260,6 +4261,46 @@ describe("model presets (config.json)", () => {
       assert.throws(() => parseModelPresetConfig({ defaultPreset: 7 }), /defaultPreset must be a non-empty string/);
     });
 
+    it("parses an escalation policy and validates it", () => {
+      const config = parseModelPresetConfig({
+        modelPresets: { fast: { model: "p/fast" }, balance: { model: "p/bal" }, smart: { model: "p/smart" } },
+        modelPresetPolicy: { prefer: "balance", escalateAt: 0.75 },
+      });
+      assert.deepEqual(config.policy, { prefer: "balance", escalateAt: 0.75 });
+
+      const asymmetric = parseModelPresetConfig({
+        modelPresets: { fast: "p/fast", balance: "p/bal", smart: "p/smart" },
+        modelPresetPolicy: { prefer: "balance", escalateAt: 0.9, downgradeAt: 0.6 },
+      });
+      assert.deepEqual(asymmetric.policy, { prefer: "balance", escalateAt: 0.9, downgradeAt: 0.6 });
+
+      assert.throws(
+        () =>
+          parseModelPresetConfig({
+            modelPresets: { balance: "m" },
+            modelPresetPolicy: { prefer: "balance", escalateAt: 0.5, downgradeAt: 0 },
+          }),
+        /downgradeAt must be a number in \(0, 1\]/,
+      );
+
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { balance: "m" }, modelPresetPolicy: { prefer: "nope", escalateAt: 0.5 } }),
+        /modelPresetPolicy.prefer "nope" is not defined/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { balance: "m" }, modelPresetPolicy: { prefer: "balance", escalateAt: 1.5 } }),
+        /escalateAt must be a number in \(0, 1\]/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { balance: "m" }, modelPresetPolicy: { prefer: "balance", escalateAt: 0 } }),
+        /escalateAt must be a number in \(0, 1\]/,
+      );
+      assert.throws(
+        () => parseModelPresetConfig({ modelPresets: { balance: "m" }, modelPresetPolicy: { prefer: "balance", escalateAt: 0.5, nope: 1 } }),
+        /modelPresetPolicy has unsupported key\(s\): nope/,
+      );
+    });
+
     it("treats defaultPreset: null as unset", () => {
       const config = parseModelPresetConfig({ modelPresets: { fast: "m" }, defaultPreset: null });
       assert.equal(config.defaultPreset, null);
@@ -4275,6 +4316,7 @@ describe("model presets (config.json)", () => {
       },
       defaultPreset: "balance",
       classifierModel: null,
+      policy: null,
       sources: [],
     };
 
@@ -4351,6 +4393,7 @@ describe("model presets (config.json)", () => {
         },
         defaultPreset: null,
         classifierModel: null,
+        policy: null,
         sources: [],
       };
 
@@ -4410,6 +4453,7 @@ describe("model presets (config.json)", () => {
         presets: { balance: { model: "p/balance" }, smart: { model: "p/smart" } },
         defaultPreset: "balance",
         classifierModel: null,
+        policy: null,
         sources: [],
       };
 
@@ -4464,6 +4508,7 @@ describe("thinking level resolution", () => {
       presets: { smart: { model: "p/smart" }, fast: { model: "p/fast" } },
       defaultPreset: null,
       classifierModel: null,
+      policy: null,
       sources: [],
     };
 
@@ -4530,6 +4575,7 @@ describe("subagent_choose_model classifier", () => {
     },
     defaultPreset: null,
     classifierModel: null,
+    policy: null,
     sources: [],
   };
 
@@ -4898,7 +4944,7 @@ describe("subagent_choose_model classifier", () => {
   it("reports classifier and configuration failures instead of guessing", async () => {
     const noPresets = await chooseSubagentModel({
       registry: makeRegistry({}),
-      config: { presets: {}, defaultPreset: null, classifierModel: null, sources: [] },
+      config: { presets: {}, defaultPreset: null, classifierModel: null, policy: null, sources: [] },
       task: "t",
     });
     assert.equal(noPresets.ok, false);
@@ -4953,7 +4999,11 @@ describe("subagent_choose_model classifier", () => {
     // description is not a difficulty signal (it used to leak `architecture`
     // style vocabulary straight into the smart criteria).
     assert.match(String(seenBuiltIn.context.questions.preset.instructions), /cheaper one/);
-    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /not a reason to escalate/);
+    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /reason to escalate/);
+    // The facts are framed for what they are: blast radius, not difficulty —
+    // an unqualified "risk: high" on every call used to push everything to smart.
+    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /blast radius/);
+    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /still workhorse work/);
 
     // Without a custom description, every tier falls back to its built-in text.
     const seenDefault: { calls?: Array<{ context?: any }> } = {};
@@ -4966,7 +5016,7 @@ describe("subagent_choose_model classifier", () => {
       task: "t",
     });
     const tierCall = (seenDefault.calls ?? [])[0];
-    assert.match(tierCall.context.questions.preset.criteria.smart, /vulnerability audits/);
+    assert.match(tierCall.context.questions.preset.criteria.smart, /hunting unknown bugs or vulnerabilities/);
     assert.match(tierCall.context.questions.preset.criteria.smart, /Slowest and most expensive/);
 
     const seenOverride: { context?: any } = {};
@@ -5051,6 +5101,104 @@ describe("subagent_choose_model classifier", () => {
       // only — `promptChars` appears for spawn-time decisions.
       assert.equal(state.promptChars, undefined);
     });
+  });
+
+  it("holds the classifier back when it cannot clear the escalation threshold", async () => {
+    const configWithPolicy: ModelPresetConfig = {
+      ...config,
+      presets: {
+        fast: { model: "prov/haiku" },
+        balance: { model: "prov/sonnet" },
+        smart: { model: "prov/opus" },
+      },
+      policy: { prefer: "balance", escalateAt: 0.75 },
+    };
+    const registry = makeRegistry({
+      answers: {
+        preset: { type: "choice", choice: "smart", probabilities: { smart: 0.68, balance: 0.29 } },
+        thinking: { type: "choice", choice: "high", probabilities: { high: 1 } },
+      },
+    });
+
+    const seen: ClassifierDecision[] = [];
+    const held = await chooseSubagentModel({
+      registry,
+      config: configWithPolicy,
+      task: "t",
+      observer: (record) => seen.push(record),
+    });
+
+    // 0.68 < 0.75 → the preferred tier wins, and the log says what happened.
+    assert.equal(held.ok && held.choice.preset, "balance");
+    assert.equal(held.ok && held.choice.requestedPreset, "smart");
+    assert.equal(held.ok && held.choice.modelParam, "balance:high");
+    const tierRecord = seen[0];
+    assert.equal(tierRecord.decision.preset, "balance");
+    assert.equal(tierRecord.decision.requestedPreset, "smart");
+    assert.equal(tierRecord.decision.requestedProbability, 0.68);
+    assert.equal(tierRecord.decision.threshold, 0.75);
+    assert.deepEqual(tierRecord.answers.preset?.probabilities, { smart: 0.68, balance: 0.29 });
+
+    // A clear case still escalates away from the preferred tier.
+    const clear = await chooseSubagentModel({
+      registry: makeRegistry({
+        answers: {
+          preset: { type: "choice", choice: "smart", probabilities: { smart: 0.96, balance: 0.03 } },
+          thinking: { type: "choice", choice: "high", probabilities: { high: 1 } },
+        },
+      }),
+      config: configWithPolicy,
+      task: "t",
+    });
+    assert.equal(clear.ok && clear.choice.preset, "smart");
+    assert.equal(clear.ok && clear.choice.requestedPreset, undefined);
+    assert.equal(clear.ok && clear.choice.modelParam, "smart:high");
+  });
+
+  it("holds cheaper deviations to the lower downgrade bar", async () => {
+    const policyConfig: ModelPresetConfig = {
+      presets: {
+        fast: { model: "prov/haiku" },
+        balance: { model: "prov/sonnet" },
+        smart: { model: "prov/opus" },
+      },
+      defaultPreset: null,
+      classifierModel: null,
+      policy: { prefer: "balance", escalateAt: 0.9, downgradeAt: 0.6 },
+      sources: [],
+    };
+    const pickFast = (probability: number) =>
+      makeRegistry({
+        answers: {
+          preset: { type: "choice", choice: "fast", probabilities: { fast: probability, balance: 0.2 } },
+          thinking: { type: "choice", choice: "low", probabilities: { low: 1 } },
+        },
+      });
+
+    // 0.70 clears the downgrade bar (0.6) → the cheap tier is allowed through.
+    // prov/haiku cannot reason, so no thinking level (and no second call).
+    const cheap = await chooseSubagentModel({ registry: pickFast(0.7), config: policyConfig, task: "t" });
+    assert.equal(cheap.ok && cheap.choice.preset, "fast");
+    assert.equal(cheap.ok && cheap.choice.modelParam, "fast");
+
+    // 0.45 does not, and the preferred tier wins instead.
+    const held = await chooseSubagentModel({ registry: pickFast(0.45), config: policyConfig, task: "t" });
+    assert.equal(held.ok && held.choice.preset, "balance");
+    assert.equal(held.ok && held.choice.requestedPreset, "fast");
+
+    // A costlier tier still has to clear the (higher) escalation bar.
+    const expensive = await chooseSubagentModel({
+      registry: makeRegistry({
+        answers: {
+          preset: { type: "choice", choice: "smart", probabilities: { smart: 0.7, balance: 0.25 } },
+          thinking: { type: "choice", choice: "high", probabilities: { high: 1 } },
+        },
+      }),
+      config: policyConfig,
+      task: "t",
+    });
+    assert.equal(expensive.ok && expensive.choice.preset, "balance");
+    assert.equal(expensive.ok && expensive.choice.requestedPreset, "smart");
   });
 
   it("registers subagent_choose_model as a spawning tool", () => {
@@ -5260,6 +5408,7 @@ describe("model reference resolution", () => {
       presets: { smart: { model: "cpa/my/gpt-6.1-sol" } },
       defaultPreset: null,
       classifierModel: null,
+      policy: null,
       sources: [],
     };
 
@@ -5345,6 +5494,7 @@ describe("model reference resolution", () => {
       presets: { smart: { model: "anthropic/claude-opus-4-1" } },
       defaultPreset: null,
       classifierModel: null,
+      policy: null,
       sources: [],
     };
 
@@ -5363,6 +5513,7 @@ describe("inherited-model thinking selection", () => {
     presets: {},
     defaultPreset: null,
     classifierModel: null,
+    policy: null,
     sources: [],
   };
 
@@ -5626,7 +5777,7 @@ describe("classifier decision observability", () => {
     classifier: { provider: "typesafe", modelId: "jev-latest" },
     model: "prov/opus",
     state: { task: "Refactor the scheduler", model: "prov/opus" },
-    questions: { thinking: { instructions: "How much effort?", criteria: ["off", "high"] } },
+    questions: { thinking: { instructions: "How much effort?", criteria: { off: "nothing to weigh", high: "subtle correctness" } } },
     answers: { thinking: { choice: "high", probabilities: { high: 0.7 }, confidence: 0.7 } },
     decision: { thinking: "high", clamped: false },
     durationMs: 12,
@@ -5704,6 +5855,7 @@ describe("classifier decision observability", () => {
       presets: { fast: { model: "prov/haiku" }, smart: { model: "prov/opus" } },
       defaultPreset: null,
       classifierModel: null,
+      policy: null,
       sources: [],
     };
 
@@ -5726,7 +5878,16 @@ describe("classifier decision observability", () => {
     assert.equal(record.final, true);
     assert.equal(record.classifier?.modelId, "jev-latest");
     assert.deepEqual(Object.keys(record.questions), ["thinking"]);
-    assert.deepEqual(record.questions.thinking.criteria, ["off", "minimal", "low", "medium", "high"]);
+    assert.deepEqual(Object.keys(record.questions.thinking.criteria), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    // The log carries the wording the classifier was actually given, so a
+    // decision can be audited without reading the source that built it.
+    assert.match(record.questions.thinking.criteria.high, /verified by re-reading source/);
     // The classifier input is part of the record — without the task text the
     // decision cannot be explained after the fact.
     // The thinking call's input also names the model that won the tier.
@@ -5736,6 +5897,8 @@ describe("classifier decision observability", () => {
     assert.equal(record.answers.thinking?.confidence, 0.6);
     assert.equal(record.decision.preset, "smart");
     assert.equal(record.decision.modelParam, "smart:high");
+    // Log-only context: what each tier meant (its model id) at this moment.
+    assert.deepEqual(record.presets, { fast: "prov/haiku", smart: "prov/opus" });
     assert.equal(record.decision.clamped, false);
     assert.equal(record.error, undefined);
     assert.equal(typeof record.durationMs, "number");
@@ -5775,6 +5938,7 @@ describe("classifier decision observability", () => {
       presets: {},
       defaultPreset: null,
       classifierModel: null,
+      policy: null,
       sources: [],
     };
 
@@ -5795,7 +5959,16 @@ describe("classifier decision observability", () => {
     // The question is phrased around failure cost and verification depth
     // (`criteria` records the offered labels; their wording lives in the code).
     assert.match(String(record.questions.thinking.instructions), /verification/);
-    assert.deepEqual(record.questions.thinking.criteria, ["off", "minimal", "low", "medium", "high"]);
+    assert.deepEqual(Object.keys(record.questions.thinking.criteria), [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
+    // The log carries the wording the classifier was actually given, so a
+    // decision can be audited without reading the source that built it.
+    assert.match(record.questions.thinking.criteria.high, /verified by re-reading source/);
     assert.equal(record.answers.thinking?.choice, "high");
     assert.deepEqual(record.decision, { thinking: "high", model: "prov/opus", clamped: false });
     assert.equal(record.error, undefined);
@@ -5831,7 +6004,7 @@ describe("classifier decision observability", () => {
 
     await chooseThinkingLevel({
       registry,
-      config: { presets: {}, defaultPreset: null, classifierModel: null, sources: [] },
+      config: { presets: {}, defaultPreset: null, classifierModel: null, policy: null, sources: [] },
       task: "x".repeat(20_000),
       model: { provider: "prov", id: "opus" },
       observer: (record) => seen.push(record),

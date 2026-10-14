@@ -1,10 +1,12 @@
 import {
+  CANONICAL_MODEL_PRESETS,
   clampThinkingLevel,
   supportedThinkingLevels,
   THINKING_DECISIONS,
   THINKING_LEVELS,
   type ModelPreset,
   type ModelPresetConfig,
+  type ModelPresetPolicy,
   type ThinkingLevelName,
 } from "./model-presets.ts";
 import {
@@ -23,8 +25,10 @@ export interface ClassifierRef {
 }
 
 export interface SubagentModelChoice {
-  /** Preset the classifier picked. */
+  /** Preset that will actually be used (after the escalation policy, if any). */
   preset: string;
+  /** Preset the classifier picked, when the policy held it back. */
+  requestedPreset?: string;
   /** Model the preset points at. */
   model: string;
   /** Level to pass to `--thinking`; absent means "no opinion, use pi's default". */
@@ -42,6 +46,8 @@ export interface SubagentModelChoice {
   thinkingClamped: boolean;
   /** False when the preset's model was not found in the catalog (no clamping). */
   modelResolved: boolean;
+  /** Escalation policy that applied to the tier decision, when configured. */
+  policy?: { prefer: string; escalateAt: number };
   usage?: unknown;
 }
 
@@ -60,6 +66,12 @@ export interface ClassifierDecision {
   /** The model the decision was made for, when known. */
   model?: string;
   /**
+   * Configured tier -> model id at decision time (`choose-model` only). Log
+   * context: it is NOT sent to the classifier, but it is what "fast/balance/
+   * smart" actually pointed at when the decision was made.
+   */
+  presets?: Record<string, string>;
+  /**
    * The exact input handed to the classifier (`task`, `agent`,
    * `agentDescription`, `model`) — without it a logged decision cannot be
    * explained after the fact.
@@ -67,8 +79,12 @@ export interface ClassifierDecision {
   state: Record<string, unknown>;
   /** Set when the task text was cut at the classifier input limit. */
   stateTruncated?: boolean;
-  /** Question id -> what was asked (criteria keys, not their descriptions). */
-  questions: Record<string, { instructions: string; criteria: string[] }>;
+  /**
+   * Question id -> exactly what was asked: the instructions, and every offered
+   * label with the description the classifier was given for it. Kept verbatim
+   * so the log can be audited without reading the source that built it.
+   */
+  questions: Record<string, { instructions: string; criteria: Record<string, string> }>;
   /** Question id -> the answer the classifier gave. */
   answers: Record<string, { choice?: string; probabilities?: Record<string, number>; confidence?: number }>;
   /** What was decided (preset/thinking/modelParam/clamped, ...). */
@@ -133,8 +149,8 @@ function classifierState(input: {
  */
 const CANONICAL_PRESET_CRITERIA: Record<string, string> = {
   fast: "Light, mechanical work with explicit instructions and little to reason about: lookups, formatting, cataloguing, small scripted edits. Fastest and cheapest",
-  balance: "The workhorse, and where most subagent tasks belong: ordinary features, fixes, tests, reviews, refactors, routine pipeline runs. Slower than fast, far cheaper than smart",
-  smart: "Heavy reasoning, design, and hard problems: bug hunting, code-vulnerability audits, cross-cutting design, debugging that needs deep analysis. Slowest and most expensive",
+  balance: "The workhorse, and where most subagent tasks belong: ordinary features, fixes, tests, reviews, refactors, routine pipeline runs, and verification against a fixed spec or snapshot. Slower than fast, far cheaper than smart",
+  smart: "Heavy reasoning, design, and hard problems: hunting unknown bugs or vulnerabilities, cross-cutting design, debugging that needs deep analysis. Slowest and most expensive. Verifying a known spec is not this tier",
 };
 
 /** What each thinking level is for, shown to the classifier as its criteria. */
@@ -270,12 +286,29 @@ function thinkingQuestion(levels: readonly ThinkingLevelName[]): Record<string, 
   };
 }
 
+/**
+ * Bar a competing tier must clear to override `prefer`. A cheaper canonical
+ * tier (`fast` < `balance` < `smart`) only has to clear `downgradeAt` — saving
+ * money should not need the confidence that spending it does. Names outside the
+ * canonical three are treated as costlier (the conservative direction).
+ */
+function policyThreshold(policy: ModelPresetPolicy, picked: string): number {
+  const order = (CANONICAL_MODEL_PRESETS as readonly string[]);
+  const preferIndex = order.indexOf(policy.prefer);
+  const pickedIndex = order.indexOf(picked);
+  if (preferIndex >= 0 && pickedIndex >= 0 && pickedIndex < preferIndex) {
+    return policy.downgradeAt ?? policy.escalateAt;
+  }
+  return policy.escalateAt;
+}
+
 const PRESET_QUESTION_INSTRUCTIONS =
   "Which model tier should handle this task? The workhorse tier is where most subagent tasks belong, so pick the " +
   "cheapest tier that can do the job and save the expensive one for the work its criteria name. If two tiers both " +
-  "fit, choose the cheaper one. Weigh the task text together with the facts in `state` (scope, risk, deliverable, " +
-  "agent tools): `agentDescription` describes the agent's role, not this task's difficulty, so it is not a reason " +
-  "to escalate.";
+  "fit, choose the cheaper one. Judge the task text, and read the facts in `state` for what they are: `scope` is how " +
+  "much surface must be read (not how hard the reasoning is), `risk` is the cost of being wrong / the blast radius " +
+  "(verifying high-risk code against a known spec is still workhorse work), and `agentDescription`/`agentRole` " +
+  "describe the agent's role — none of them is a reason to escalate by itself.";
 
 /**
  * Union of the thinking levels the candidate models support, in ascending order
@@ -314,7 +347,12 @@ function describeQuestions(questions: Record<string, unknown>): ClassifierDecisi
     const criteria = value.criteria != null && typeof value.criteria === "object" ? value.criteria : {};
     described[id] = {
       instructions: typeof value.instructions === "string" ? value.instructions : "",
-      criteria: Object.keys(criteria as Record<string, unknown>),
+      criteria: Object.fromEntries(
+        Object.entries(criteria as Record<string, unknown>).map(([label, text]) => [
+          label,
+          typeof text === "string" ? text : String(text),
+        ]),
+      ),
     };
   }
   return described;
@@ -422,6 +460,10 @@ export async function chooseSubagentModel(input: {
     agentDescription: input.agentDescription,
     context: input.context,
   });
+  // Log-only: which concrete model each tier pointed at when this ran.
+  const presetFields = {
+    presets: Object.fromEntries(presetNames.map((name) => [name, input.config.presets[name].model])),
+  };
   const presetQuestion =
     presetNames.length > 1
       ? {
@@ -438,6 +480,7 @@ export async function chooseSubagentModel(input: {
     reportDecision(input.observer, {
       at: new Date().toISOString(),
       kind: "choose-model",
+      ...presetFields,
       ...tierState.fields,
       questions: describeQuestions(presetQuestion ? { preset: presetQuestion } : {}),
       answers: {},
@@ -476,6 +519,7 @@ export async function chooseSubagentModel(input: {
       reportDecision(input.observer, {
         at: new Date().toISOString(),
         kind: "choose-model",
+        ...presetFields,
         classifier: { provider: ref.provider, modelId: ref.modelId },
         ...tierState.fields,
         questions: describeQuestions({ preset: presetQuestion }),
@@ -495,6 +539,7 @@ export async function chooseSubagentModel(input: {
       reportDecision(input.observer, {
         at: new Date().toISOString(),
         kind: "choose-model",
+        ...presetFields,
         classifier: { provider: ref.provider, modelId: ref.modelId },
         ...tierState.fields,
         questions: describeQuestions({ preset: presetQuestion }),
@@ -514,7 +559,22 @@ export async function chooseSubagentModel(input: {
     return { ok: false, error: `Classifier ${who} returned no usable preset answer.` };
   }
 
-  const preset = input.config.presets[presetPick.choice];
+  // Escalation policy: the preferred (usually cheaper) tier wins unless the
+  // classifier's pick clears `escalateAt`, so a cheap default is not given up
+  // on a weak margin. The raw probabilities stay in the record either way.
+  const escalation = input.config.policy;
+  let appliedPreset = presetPick.choice;
+  let heldBack: { requested: string; probability: number; threshold: number } | undefined;
+  if (escalation && appliedPreset !== escalation.prefer && input.config.presets[escalation.prefer]) {
+    const probability = presetPick.probabilities[appliedPreset] ?? 0;
+    const threshold = policyThreshold(escalation, appliedPreset);
+    if (probability < threshold) {
+      heldBack = { requested: appliedPreset, probability, threshold };
+      appliedPreset = escalation.prefer;
+    }
+  }
+
+  const preset = input.config.presets[appliedPreset];
   const policy = preset.thinking ?? THINKING_DECISIONS;
 
   // The concrete model the chosen tier points at decides which levels call 2 may
@@ -540,15 +600,23 @@ export async function chooseSubagentModel(input: {
     reportDecision(input.observer, {
       at: new Date().toISOString(),
       kind: "choose-model",
+      ...presetFields,
       classifier: { provider: ref.provider, modelId: ref.modelId },
       model: preset.model,
       ...tierState.fields,
       questions: describeQuestions({ preset: presetQuestion }),
       answers: describeAnswers(tierResult),
       decision: {
-        preset: presetPick.choice,
+        preset: appliedPreset,
         model: preset.model,
         policy,
+        ...(heldBack
+          ? {
+              requestedPreset: heldBack.requested,
+              requestedProbability: heldBack.probability,
+              threshold: heldBack.threshold,
+            }
+          : {}),
         ...(pinnedThinking ? { thinking: pinnedThinking } : {}),
       },
       durationMs: tierDurationMs,
@@ -588,6 +656,7 @@ export async function chooseSubagentModel(input: {
       reportDecision(input.observer, {
         at: new Date().toISOString(),
         kind: "choose-thinking",
+        ...presetFields,
         classifier: { provider: ref.provider, modelId: ref.modelId },
         model: preset.model,
         ...thinkingState.fields,
@@ -608,6 +677,7 @@ export async function chooseSubagentModel(input: {
       reportDecision(input.observer, {
         at: new Date().toISOString(),
         kind: "choose-thinking",
+        ...presetFields,
         classifier: { provider: ref.provider, modelId: ref.modelId },
         model: preset.model,
         ...thinkingState.fields,
@@ -634,15 +704,23 @@ export async function chooseSubagentModel(input: {
     reportDecision(input.observer, {
       at: new Date().toISOString(),
       kind: "choose-thinking",
+      ...presetFields,
       classifier: { provider: ref.provider, modelId: ref.modelId },
       model: preset.model,
       ...thinkingState.fields,
       questions: describeQuestions(thinkingQuestions),
       answers: describeAnswers(thinkingResult),
       decision: {
-        preset: presetPick.choice,
+        preset: appliedPreset,
         model: preset.model,
-        modelParam: thinking ? `${presetPick.choice}:${thinking}` : presetPick.choice,
+        modelParam: thinking ? `${appliedPreset}:${thinking}` : appliedPreset,
+        ...(heldBack
+          ? {
+              requestedPreset: heldBack.requested,
+              requestedProbability: heldBack.probability,
+              threshold: heldBack.threshold,
+            }
+          : {}),
         ...(thinking ? { thinking } : {}),
         ...(requested && requested !== thinking ? { requested } : {}),
         clamped: thinkingClamped,
@@ -658,10 +736,11 @@ export async function chooseSubagentModel(input: {
   return {
     ok: true,
     choice: {
-      preset: presetPick.choice,
+      preset: appliedPreset,
+      ...(heldBack ? { requestedPreset: heldBack.requested } : {}),
       model: preset.model,
       ...(thinking ? { thinking } : {}),
-      modelParam: thinking ? `${presetPick.choice}:${thinking}` : presetPick.choice,
+      modelParam: thinking ? `${appliedPreset}:${thinking}` : appliedPreset,
       presetProbabilities: presetPick.probabilities,
       ...(presetPick.confidence !== undefined ? { presetConfidence: presetPick.confidence } : {}),
       ...(thinkingPick?.probabilities ? { thinkingProbabilities: thinkingPick.probabilities } : {}),
@@ -670,6 +749,7 @@ export async function chooseSubagentModel(input: {
       ...(supported ? { supportedThinkingLevels: supported } : {}),
       thinkingClamped,
       modelResolved: chatModel !== undefined,
+      ...(escalation ? { policy: escalation } : {}),
       ...((thinkingResult ?? tierResult)?.usage !== undefined
         ? { usage: thinkingResult?.usage ?? tierResult?.usage }
         : {}),

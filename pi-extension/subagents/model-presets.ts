@@ -116,6 +116,24 @@ export function clampThinkingLevel(
   return available[0] ?? "off";
 }
 
+/**
+ * Cost guard for the tier decision: the classifier's winner must clear
+ * `escalateAt` to override `prefer`, so the preferred (usually cheaper) tier is
+ * the default and only a clear case escalates away from it.
+ */
+export interface ModelPresetPolicy {
+  /** Tier that wins unless another one clears the threshold. */
+  prefer: string;
+  /** Probability (0..1] a costlier tier must reach to win (e.g. smart). */
+  escalateAt: number;
+  /**
+   * Probability (0..1] a cheaper tier must reach to win (e.g. fast). Cheaper
+   * deviations are held to a lower bar — downgrading saves money, so it does
+   * not need the same confidence. Defaults to `escalateAt`.
+   */
+  downgradeAt?: number;
+}
+
 export interface ModelPresetConfig {
   /** Preset name -> model, merged across every config layer. */
   presets: Record<string, ModelPreset>;
@@ -126,6 +144,8 @@ export interface ModelPresetConfig {
    * `null` means "use the first available classifier model".
    */
   classifierModel: string | null;
+  /** Optional escalation policy for the tier decision. `null` when unset. */
+  policy: ModelPresetPolicy | null;
   /** Config files that contributed to this result, in ascending priority order. */
   sources: string[];
 }
@@ -271,6 +291,40 @@ export function parseModelPresetConfig(raw: unknown, sources: string[] = []): Mo
     }
   }
 
+  let policy: ModelPresetPolicy | null = null;
+  if (raw.modelPresetPolicy !== undefined && raw.modelPresetPolicy !== null) {
+    if (!isPlainObject(raw.modelPresetPolicy)) invalid(source, "modelPresetPolicy must be an object");
+    const policyValue = raw.modelPresetPolicy;
+
+    const unsupported = Object.keys(policyValue).filter(
+      (key) => key !== "prefer" && key !== "escalateAt" && key !== "downgradeAt",
+    );
+    if (unsupported.length > 0) {
+      invalid(source, `modelPresetPolicy has unsupported key(s): ${unsupported.join(", ")}`);
+    }
+
+    const prefer = typeof policyValue.prefer === "string" ? policyValue.prefer.trim() : "";
+    if (!prefer) invalid(source, "modelPresetPolicy.prefer must be a preset name");
+    if (!(prefer in presets)) {
+      invalid(source, `modelPresetPolicy.prefer "${prefer}" is not defined in modelPresets`);
+    }
+
+    const escalateAt = policyValue.escalateAt;
+    if (typeof escalateAt !== "number" || !Number.isFinite(escalateAt) || escalateAt <= 0 || escalateAt > 1) {
+      invalid(source, "modelPresetPolicy.escalateAt must be a number in (0, 1]");
+    }
+
+    const downgradeAt = policyValue.downgradeAt;
+    if (
+      downgradeAt !== undefined &&
+      (typeof downgradeAt !== "number" || !Number.isFinite(downgradeAt) || downgradeAt <= 0 || downgradeAt > 1)
+    ) {
+      invalid(source, "modelPresetPolicy.downgradeAt must be a number in (0, 1]");
+    }
+
+    policy = { prefer, escalateAt, ...(downgradeAt !== undefined ? { downgradeAt } : {}) };
+  }
+
   let classifierModel: string | null = null;
   if (raw.classifierModel !== undefined && raw.classifierModel !== null) {
     if (typeof raw.classifierModel !== "string" || !raw.classifierModel.trim()) {
@@ -279,7 +333,7 @@ export function parseModelPresetConfig(raw: unknown, sources: string[] = []): Mo
     classifierModel = raw.classifierModel.trim();
   }
 
-  return { presets, defaultPreset, classifierModel, sources: [...sources] };
+  return { presets, defaultPreset, classifierModel, policy, sources: [...sources] };
 }
 
 /**
