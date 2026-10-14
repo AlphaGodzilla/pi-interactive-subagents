@@ -132,9 +132,9 @@ function classifierState(input: {
  * `description`. A `description` in config.json replaces the matching text.
  */
 const CANONICAL_PRESET_CRITERIA: Record<string, string> = {
-  fast: "Quick, cheap work: reconnaissance, lookups, formatting, small mechanical edits",
-  balance: "Everyday implementation: ordinary features, fixes, tests, reviews, refactors",
-  smart: "Demanding work: subtle design, hard debugging, cross-cutting changes, architecture",
+  fast: "Light, mechanical work with explicit instructions and little to reason about: lookups, formatting, cataloguing, small scripted edits. Fastest and cheapest",
+  balance: "The workhorse, and where most subagent tasks belong: ordinary features, fixes, tests, reviews, refactors, routine pipeline runs. Slower than fast, far cheaper than smart",
+  smart: "Heavy reasoning, design, and hard problems: bug hunting, code-vulnerability audits, cross-cutting design, debugging that needs deep analysis. Slowest and most expensive",
 };
 
 /** What each thinking level is for, shown to the classifier as its criteria. */
@@ -271,9 +271,11 @@ function thinkingQuestion(levels: readonly ThinkingLevelName[]): Record<string, 
 }
 
 const PRESET_QUESTION_INSTRUCTIONS =
-  "Which model tier fits this task's shape — read-only reconnaissance of a named surface, " +
-  "implementation against a spec, or verification whose failure cost is high? Weigh the task " +
-  "text together with the facts in `state` (scope, risk, deliverable, agent tools).";
+  "Which model tier should handle this task? The workhorse tier is where most subagent tasks belong, so pick the " +
+  "cheapest tier that can do the job and save the expensive one for the work its criteria name. If two tiers both " +
+  "fit, choose the cheaper one. Weigh the task text together with the facts in `state` (scope, risk, deliverable, " +
+  "agent tools): `agentDescription` describes the agent's role, not this task's difficulty, so it is not a reason " +
+  "to escalate.";
 
 /**
  * Union of the thinking levels the candidate models support, in ascending order

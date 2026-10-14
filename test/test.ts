@@ -4943,10 +4943,31 @@ describe("subagent_choose_model classifier", () => {
     });
 
     const criteria = seenBuiltIn.context.questions.preset.criteria;
-    assert.match(criteria.fast, /reconnaissance/);
-    assert.match(criteria.balance, /Everyday implementation/);
+    assert.match(criteria.fast, /mechanical/);
+    assert.match(criteria.fast, /Fastest and cheapest/);
+    assert.match(criteria.balance, /workhorse/);
+    assert.match(criteria.balance, /most subagent tasks/);
     // The fixture's smart preset carries its own description, which wins.
     assert.equal(criteria.smart, "Hard design and debugging");
+    // The question says which way to break a tie, and that the agent's role
+    // description is not a difficulty signal (it used to leak `architecture`
+    // style vocabulary straight into the smart criteria).
+    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /cheaper one/);
+    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /not a reason to escalate/);
+
+    // Without a custom description, every tier falls back to its built-in text.
+    const seenDefault: { calls?: Array<{ context?: any }> } = {};
+    await chooseSubagentModel({
+      registry: makeRegistry({
+        seen: seenDefault,
+        answers: { preset: { choice: "smart", probabilities: { smart: 1 } } },
+      }),
+      config: { ...config, presets: { fast: { model: "prov/haiku" }, smart: { model: "prov/opus" } } },
+      task: "t",
+    });
+    const tierCall = (seenDefault.calls ?? [])[0];
+    assert.match(tierCall.context.questions.preset.criteria.smart, /vulnerability audits/);
+    assert.match(tierCall.context.questions.preset.criteria.smart, /Slowest and most expensive/);
 
     const seenOverride: { context?: any } = {};
     await chooseSubagentModel({
