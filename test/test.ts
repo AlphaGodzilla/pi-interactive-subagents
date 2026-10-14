@@ -5250,7 +5250,9 @@ describe("subagent_choose_model classifier", () => {
   });
 
   it("runs end to end through the registered tool with a project config", async () => {
-    await withTempDirAsync(async (dir) => {
+    // Isolated agent dir: the developer's real global config.json (which may
+    // carry a modelPresetPolicy) must not leak into the assertion.
+    await withIsolatedAgentEnv(async ({ projectDir: dir }) => {
       const configDir = join(dir, ".pi", "extensions", "pi-interactive-subagents");
       mkdirSync(configDir, { recursive: true });
       writeFileSync(
