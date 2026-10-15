@@ -121,7 +121,7 @@ function classifierState(input: {
   agentDescription?: string;
   model?: string;
   /**
-   * Extra machine-readable facts the caller knows (scope, risk, deliverable,
+   * Extra machine-readable facts the caller knows (scope, deliverable,
    * agent tools, cwd, parent model, ...). Prose task text alone carries no
    * difficulty signal; these are what make the question answerable.
    */
@@ -280,7 +280,7 @@ function thinkingQuestion(levels: readonly ThinkingLevelName[]): Record<string, 
     type: "choice",
     instructions:
       "How costly would a wrong or shallow answer be for this task, and how deep must the " +
-      "verification go? Judge the task text together with the facts in `state` (scope, risk, " +
+      "verification go? Judge the task text together with the facts in `state` (scope, " +
       "deliverable, agent tools, model).",
     criteria: Object.fromEntries(levels.map((level) => [level, THINKING_CRITERIA[level]])),
   };
@@ -306,8 +306,7 @@ const PRESET_QUESTION_INSTRUCTIONS =
   "Which model tier should handle this task? The workhorse tier is where most subagent tasks belong, so pick the " +
   "cheapest tier that can do the job and save the expensive one for the work its criteria name. If two tiers both " +
   "fit, choose the cheaper one. Judge the task text, and read the facts in `state` for what they are: `scope` is how " +
-  "much surface must be read (not how hard the reasoning is), `risk` is the cost of being wrong / the blast radius " +
-  "(verifying high-risk code against a known spec is still workhorse work), and `agentDescription`/`agentRole` " +
+  "much surface must be read (not how hard the reasoning is), and `agentDescription`/`agentRole` " +
   "describe the agent's role — none of them is a reason to escalate by itself.";
 
 /**
@@ -435,7 +434,7 @@ export async function chooseSubagentModel(input: {
   agentName?: string;
   agentDescription?: string;
   task: string;
-  /** Extra machine-readable facts for the classifier (scope, risk, tools, ...). */
+  /** Extra machine-readable facts for the classifier (scope, tools, ...). */
   context?: Record<string, unknown>;
   signal?: AbortSignal;
   observer?: ClassifierObserver;
@@ -791,7 +790,7 @@ export async function chooseThinkingLevel(input: {
   task: string;
   /** The model the child will run on; decides which levels are offered. */
   model?: { provider?: string; id?: string };
-  /** Extra machine-readable facts for the classifier (scope, risk, tools, ...). */
+  /** Extra machine-readable facts for the classifier (scope, tools, ...). */
   context?: Record<string, unknown>;
   signal?: AbortSignal;
   observer?: ClassifierObserver;

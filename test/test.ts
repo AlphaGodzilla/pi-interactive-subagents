@@ -5000,10 +5000,10 @@ describe("subagent_choose_model classifier", () => {
     // style vocabulary straight into the smart criteria).
     assert.match(String(seenBuiltIn.context.questions.preset.instructions), /cheaper one/);
     assert.match(String(seenBuiltIn.context.questions.preset.instructions), /reason to escalate/);
-    // The facts are framed for what they are: blast radius, not difficulty —
-    // an unqualified "risk: high" on every call used to push everything to smart.
-    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /blast radius/);
-    assert.match(String(seenBuiltIn.context.questions.preset.instructions), /still workhorse work/);
+    // `risk` was removed as a decision input: callers set it to "high" on every
+    // single call (41/41 in the logs), so it carried no signal and only pushed
+    // tiers upward.
+    assert.doesNotMatch(String(seenBuiltIn.context.questions.preset.instructions), /risk/);
 
     // Without a custom description, every tier falls back to its built-in text.
     const seenDefault: { calls?: Array<{ context?: any }> } = {};
@@ -5266,11 +5266,17 @@ describe("subagent_choose_model classifier", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
       const tool = registeredTools.find((entry) => entry.name === "subagent_choose_model");
+      // `risk` is gone from the declared parameters: callers set it to "high" on
+      // every call in practice (41/41), so it was removed as a decision input.
+      const schemaProps = (tool.parameters as any).properties;
+      assert.equal("risk" in schemaProps, false);
+      assert.ok("scope" in schemaProps);
+      assert.ok("deliverable" in schemaProps);
 
       const notifications: string[] = [];
       const result = await tool.execute(
         "call-1",
-        { task: "Hard refactor", scope: "71 GET routes", risk: "high", deliverable: "docs" },
+        { task: "Hard refactor", scope: "71 GET routes", deliverable: "docs" },
         undefined,
         undefined,
         {
@@ -5317,7 +5323,8 @@ describe("subagent_choose_model classifier", () => {
       // The caller's facts and the locally computed ones are both logged.
       for (const record of records) {
         assert.equal(record.state.scope, "71 GET routes");
-        assert.equal(record.state.risk, "high");
+        // `risk` is not part of the classifier input any more.
+        assert.equal(record.state.risk, undefined);
         assert.equal(record.state.deliverable, "docs");
         assert.equal(record.state.taskChars, "Hard refactor".length);
         assert.equal(record.state.cwd, dir);

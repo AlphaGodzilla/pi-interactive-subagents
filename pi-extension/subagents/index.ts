@@ -3019,12 +3019,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               "How much surface the task covers, in your own words with numbers where you have them — e.g. \"71 GET routes\", \"1 controller + its service\", \"whole repo\". This is the strongest size signal the classifier gets; without it a 71-route sweep and a single-route check look alike.",
           }),
         ),
-        risk: Type.Optional(
-          Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], {
-            description:
-              "How costly a wrong answer would be: `low` = caught immediately by a command or test, `medium` = caught during the work, `high` = it can look right and needs verification against source/invariants.",
-          }),
-        ),
         deliverable: Type.Optional(
           Type.Union([Type.Literal("report"), Type.Literal("docs"), Type.Literal("code")], {
             description: "What the subagent produces: a read-only report, documentation/model edits, or code changes.",
@@ -3086,7 +3080,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               parentModel: sessionFile ? resolveParentModel(sessionFile) : null,
             }),
             ...(params.scope ? { scope: params.scope } : {}),
-            ...(params.risk ? { risk: params.risk } : {}),
             ...(params.deliverable ? { deliverable: params.deliverable } : {}),
           },
           signal,
